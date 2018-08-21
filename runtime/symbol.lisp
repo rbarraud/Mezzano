@@ -21,7 +21,8 @@
   (let ((value (sys.int::%object-ref-t cell sys.int::+symbol-value-cell-value+)))
     (when (sys.int::%unbound-value-p value)
       (sys.int::raise-unbound-error
-       (symbol-value-cell-symbol cell)))
+       (symbol-value-cell-symbol cell))
+      (sys.int::%%unreachable))
     value))
 
 (defun (setf symbol-value-cell-value) (value cell)
@@ -108,7 +109,12 @@
                 old new))
 
 (define-compiler-macro symbol-value-cell (symbol)
-  `(fast-symbol-value-cell ,symbol))
+  (let ((sym (gensym)))
+    `(let ((,sym ,symbol))
+       (when (not (symbolp ,sym))
+         (sys.int::raise-type-error ,sym 'symbol)
+         (sys.int::%%unreachable))
+       (fast-symbol-value-cell ,sym))))
 
 (defun symbol-value-cell (symbol)
   (sys.int::%type-check symbol sys.int::+object-tag-symbol+ 'symbol)
@@ -205,6 +211,7 @@
           ((:global) sys.int::+symbol-mode-global+)))
   value)
 
+(declaim (inline sys.int::%atomic-fixnum-add-symbol))
 (defun sys.int::%atomic-fixnum-add-symbol (symbol value)
   (sys.int::%atomic-fixnum-add-object (symbol-value-cell symbol)
                                       sys.int::+symbol-value-cell-value+

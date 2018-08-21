@@ -1,4 +1,4 @@
-;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
+;;;; Copyright (c) 2011-2017 Henry Harrington <henry.harrington@gmail.com>
 ;;;; This code is licensed under the MIT license.
 
 (in-package :mezzano.runtime)
@@ -14,43 +14,68 @@
        (simple-vector
         (sys.int::%%disestablish-block-or-tagbody))
        (function
-        (sys.int::%%disestablish-unwind-protect)))))
+        (sys.int::%%disestablish-unwind-protect))
+       (mezzano.delimited-continuations:prompt-tag
+        ;; Delimited continuation marker.
+        ;; Restore thread's stack object.
+        (setf (mezzano.supervisor::thread-stack (mezzano.supervisor::current-thread))
+              (sys.int::%object-ref-t (sys.int::%%special-stack-pointer) 3))
+        (setf (sys.int::%%special-stack-pointer)
+              (svref (sys.int::%%special-stack-pointer) 0))))))
 
+(defmacro do-variable-bindings ((value symbol &optional result) &body body)
+  (let ((ssp (gensym "SSP"))
+        (sym (gensym)))
+    `(loop
+        with ,sym = ,symbol
+        for ,ssp = (sys.int::%%special-stack-pointer) then (svref ,ssp 0)
+        until (null ,ssp)
+        when (eql (svref ,ssp 1) ,sym)
+        do (let ((,value (svref ,ssp 2)))
+             ,@body)
+        finally (return ,result))))
+
+;; Scary note: This is not treated like a normal dynamic variable.
+;; The variable itself is not a list, instead the active binding
+;; cells are used to simulate one.
 (defvar *active-catch-handlers*)
 (defun sys.int::%catch (tag fn)
   ;; Catch is used in low levelish code, so must avoid allocation.
-  (let ((vec (sys.c::make-dx-simple-vector 3)))
-    (setf (svref vec 0) *active-catch-handlers*
-          (svref vec 1) tag
-          (svref vec 2) (flet ((exit-fn (values)
-                                 (return-from sys.int::%catch (values-list values))))
-                          (declare (dynamic-extent (function exit-fn)))
-                          #'exit-fn))
-    (let ((*active-catch-handlers* vec))
-      (funcall fn))))
+  (let ((vec (sys.c::make-dx-simple-vector 2)))
+    (flet ((exit-fn (values)
+             (return-from sys.int::%catch (values-list values))))
+      (declare (dynamic-extent (function exit-fn)))
+      (setf (svref vec 0) tag
+            (svref vec 1) #'exit-fn)
+      (let ((*active-catch-handlers* vec))
+        (funcall fn)))))
 
 (defun sys.int::%throw (tag values)
   ;; Note! The VALUES list has dynamic extent!
   ;; This is fine, as the exit function calls VALUES-LIST on it before unwinding.
-  (do ((current *active-catch-handlers* (svref current 0)))
-      ((not current)
-       (error 'sys.int::bad-catch-tag-error :tag tag))
-    (when (eq (svref current 1) tag)
-      (funcall (svref current 2) values))))
+  (do-variable-bindings (value '*active-catch-handlers*
+                         (error 'sys.int::bad-catch-tag-error :tag tag))
+    (when (eq (svref value 0) tag)
+      (funcall (svref value 1) values))))
 
 (defun sys.int::%coerce-to-callable (object)
-  (etypecase object
+  (typecase object
     (function object)
     (symbol
      ;; Fast-path for symbols.
-     (let ((fref (sys.int::%object-ref-t object sys.int::+symbol-function+)))
-       (when (not fref)
-         (return-from sys.int::%coerce-to-callable
-           (fdefinition object)))
-       (let ((fn (sys.int::%object-ref-t fref sys.int::+fref-function+)))
+     (let* ((fref (or (sys.int::%object-ref-t object sys.int::+symbol-function+)
+                      (sys.int::function-reference object)))
+            (fn (sys.int::%object-ref-t fref sys.int::+fref-function+)))
          (if (sys.int::%undefined-function-p fn)
-             (fdefinition object)
-             fn))))))
+             ;; Return a function that will signal an undefined-function error
+             ;; with appropriate restarts when called.
+             ;; This is not inlined so as to avoid closing over object in
+             ;; the common case.
+             (sys.int::make-deferred-undefined-function fref)
+             fn)))
+    (t
+     (sys.int::raise-type-error object '(or function symbol))
+     (%%unreachable))))
 
 (declaim (inline %object-slot-address))
 (defun %object-slot-address (object slot)
@@ -58,6 +83,34 @@
      (- sys.int::+tag-object+)
      8
      (* slot 8)))
+
+(defun %%object-of-type-p (object object-tag)
+  (eq (sys.int::%object-tag object) object-tag))
+
+(declaim (inline sys.int::%object-of-type-p))
+(defun sys.int::%object-of-type-p (object object-tag)
+  (and (sys.int::%value-has-tag-p object sys.int::+tag-object+)
+       (%%object-of-type-p object object-tag)))
+
+(declaim (inline sys.int::%type-check))
+(defun sys.int::%type-check (object object-tag expected-type)
+  (unless (sys.int::%object-of-type-p object object-tag)
+    (sys.int::raise-type-error object expected-type)
+    (sys.int::%%unreachable)))
+
+(declaim (inline characterp))
+(defun characterp (object)
+  (sys.int::%value-has-tag-p object sys.int::+tag-character+))
+
+(defun %functionp (object)
+  (<= sys.int::+first-function-object-tag+
+      (sys.int::%object-tag object)
+      sys.int::+last-function-object-tag+))
+
+(declaim (inline functionp))
+(defun functionp (object)
+  (and (sys.int::%value-has-tag-p object sys.int::+tag-object+)
+       (%functionp object)))
 
 (in-package :sys.int)
 
@@ -110,59 +163,77 @@ thread's stack if this function is called from normal code."
                          (- return-address address))))
        (decf address 16)))
 
-(declaim (inline memref-t (setf memref-t)))
+(declaim (inline memref-t (setf memref-t) (cas memref-t)))
 (defun memref-t (base &optional (index 0))
   (%memref-t base index))
 (defun (setf memref-t) (value base &optional (index 0))
   (setf (%memref-t base index) value))
+(defun (cas memref-t) (old new base &optional (index 0))
+  (cas (%memref-t base index) old new))
 
-(declaim (inline memref-unsigned-byte-8 (setf memref-unsigned-byte-8)))
+(declaim (inline memref-unsigned-byte-8 (setf memref-unsigned-byte-8) (cas memref-unsigned-byte-8)))
 (defun memref-unsigned-byte-8 (base &optional (index 0))
   (%memref-unsigned-byte-8 base index))
 (defun (setf memref-unsigned-byte-8) (value base &optional (index 0))
   (setf (%memref-unsigned-byte-8 base index) value))
+(defun (cas memref-unsigned-byte-8) (old new base &optional (index 0))
+  (cas (%memref-unsigned-byte-8 base index) old new))
 
-(declaim (inline memref-unsigned-byte-16 (setf memref-unsigned-byte-16)))
+(declaim (inline memref-unsigned-byte-16 (setf memref-unsigned-byte-16) (cas memref-unsigned-byte-16)))
 (defun memref-unsigned-byte-16 (base &optional (index 0))
   (%memref-unsigned-byte-16 base index))
 (defun (setf memref-unsigned-byte-16) (value base &optional (index 0))
   (setf (%memref-unsigned-byte-16 base index) value))
+(defun (cas memref-unsigned-byte-16) (old new base &optional (index 0))
+  (cas (%memref-unsigned-byte-16 base index) old new))
 
-(declaim (inline memref-unsigned-byte-32 (setf memref-unsigned-byte-32)))
+(declaim (inline memref-unsigned-byte-32 (setf memref-unsigned-byte-32) (cas memref-unsigned-byte-32)))
 (defun memref-unsigned-byte-32 (base &optional (index 0))
   (%memref-unsigned-byte-32 base index))
 (defun (setf memref-unsigned-byte-32) (value base &optional (index 0))
   (setf (%memref-unsigned-byte-32 base index) value))
+(defun (cas memref-unsigned-byte-32) (old new base &optional (index 0))
+  (cas (%memref-unsigned-byte-32 base index) old new))
 
-(declaim (inline memref-unsigned-byte-64 (setf memref-unsigned-byte-64)))
+(declaim (inline memref-unsigned-byte-64 (setf memref-unsigned-byte-64) (cas memref-unsigned-byte-64)))
 (defun memref-unsigned-byte-64 (base &optional (index 0))
   (%memref-unsigned-byte-64 base index))
 (defun (setf memref-unsigned-byte-64) (value base &optional (index 0))
   (setf (%memref-unsigned-byte-64 base index) value))
+(defun (cas memref-unsigned-byte-64) (old new base &optional (index 0))
+  (cas (%memref-unsigned-byte-64 base index) old new))
 
-(declaim (inline memref-signed-byte-8 (setf memref-signed-byte-8)))
+(declaim (inline memref-signed-byte-8 (setf memref-signed-byte-8) (cas memref-signed-byte-8)))
 (defun memref-signed-byte-8 (base &optional (index 0))
   (%memref-signed-byte-8 base index))
 (defun (setf memref-signed-byte-8) (value base &optional (index 0))
   (setf (%memref-signed-byte-8 base index) value))
+(defun (cas memref-signed-byte-8) (old new base &optional (index 0))
+  (cas (%memref-signed-byte-8 base index) old new))
 
-(declaim (inline memref-signed-byte-16 (setf memref-signed-byte-16)))
+(declaim (inline memref-signed-byte-16 (setf memref-signed-byte-16) (cas memref-signed-byte-16)))
 (defun memref-signed-byte-16 (base &optional (index 0))
   (%memref-signed-byte-16 base index))
 (defun (setf memref-signed-byte-16) (value base &optional (index 0))
   (setf (%memref-signed-byte-16 base index) value))
+(defun (cas memref-signed-byte-16) (old new base &optional (index 0))
+  (cas (%memref-signed-byte-16 base index) old new))
 
-(declaim (inline memref-signed-byte-32 (setf memref-signed-byte-32)))
+(declaim (inline memref-signed-byte-32 (setf memref-signed-byte-32) (cas memref-signed-byte-32)))
 (defun memref-signed-byte-32 (base &optional (index 0))
   (%memref-signed-byte-32 base index))
 (defun (setf memref-signed-byte-32) (value base &optional (index 0))
   (setf (%memref-signed-byte-32 base index) value))
+(defun (cas memref-signed-byte-32) (old new base &optional (index 0))
+  (cas (%memref-signed-byte-32 base index) old new))
 
-(declaim (inline memref-signed-byte-64 (setf memref-signed-byte-64)))
+(declaim (inline memref-signed-byte-64 (setf memref-signed-byte-64) (cas memref-signed-byte-64)))
 (defun memref-signed-byte-64 (base &optional (index 0))
   (%memref-signed-byte-64 base index))
 (defun (setf memref-signed-byte-64) (value base &optional (index 0))
   (setf (%memref-signed-byte-64 base index) value))
+(defun (cas memref-signed-byte-64) (old new base &optional (index 0))
+  (cas (%memref-signed-byte-64 base index) old new))
 
 (declaim (inline %object-ref-unsigned-byte-8 (setf %object-ref-unsigned-byte-8)))
 (defun %object-ref-unsigned-byte-8 (object index)
@@ -226,6 +297,16 @@ thread's stack if this function is called from normal code."
 (defun %object-ref-double-float (object index)
   (%integer-as-double-float (%object-ref-unsigned-byte-64 object index)))
 (defun (setf %object-ref-double-float) (value object index)
+  (check-type value double-float)
   (setf (%object-ref-unsigned-byte-64 object index)
         (%double-float-as-integer value))
   value)
+
+(declaim (inline %bounds-check))
+(defun %bounds-check (object slot)
+  (unless (fixnump slot)
+    (raise-type-error slot 'fixnum)
+    (sys.int::%%unreachable))
+  (unless (< (the fixnum slot) (the fixnum (%object-header-data object)))
+    (raise-bounds-error object slot)
+    (sys.int::%%unreachable)))

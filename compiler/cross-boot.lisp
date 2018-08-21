@@ -34,6 +34,10 @@
       (setf (gethash name *inline-forms*) source-lambda))
   nil)
 
+(defmacro sys.int::cas (place old new)
+  (declare (ignore place old new))
+  `(error "Cross-cas not supported"))
+
 (defun sys.int::%defun (name lambda)
   ;; Completely ignore CAS functions when cross compiling, they're not needed.
   (unless (and (consp name) (eql (first name) 'sys.int::cas))
@@ -128,7 +132,7 @@
 
 (defun sys.int::symbol-mode (symbol)
   (check-type symbol symbol)
-  (values (gethash symbol *system-symbol-declarations*)))
+  (sys.int::variable-information symbol))
 
 (defun mezzano.runtime::symbol-type (symbol)
   (check-type symbol symbol)
@@ -158,8 +162,7 @@
 
 (defun sys.int::%defstruct (def)
   (when (gethash (structure-type-name def) *structure-types*)
-    (assert (eql (gethash (structure-type-name def) *structure-types*) def))
-    (assert (eql (get (structure-type-name def) 'sys.int::structure-type) def)))
+    (assert (eql (gethash (structure-type-name def) *structure-types*) def)))
   (let ((predicate (gensym (string (structure-type-name def)))))
     (setf (symbol-function predicate) (lambda (x)
                                         (and (cross-struct-p x)
@@ -169,7 +172,6 @@
                 (eql (symbol-package (structure-type-name def))
                      (find-package "SYS.C")))
       (eval `(cl:deftype ,(structure-type-name def) () '(satisfies ,predicate))))
-    (setf (get (structure-type-name def) 'sys.int::structure-type) def)
     (setf (gethash (structure-type-name def) *structure-types*) def)))
 
 (defun sys.int::%make-struct (length area)
@@ -287,3 +289,21 @@
 
 (defun mezzano.clos:class-precedence-list (class)
   (sb-mop:class-precedence-list class))
+
+(defun convert-internal-time-units (time)
+  (* time
+     (/ internal-time-units-per-second
+        cl:internal-time-units-per-second)))
+
+(defun get-internal-run-time ()
+  (convert-internal-time-units
+   (cl:get-internal-run-time)))
+
+(defun get-internal-real-time ()
+  (convert-internal-time-units
+   (cl:get-internal-real-time)))
+
+(defun sys.int::%type-check (object tag type)
+  (declare (ignore tag))
+  (when (not (typep object type))
+    (error "Type error: ~S not of type ~S." object type)))

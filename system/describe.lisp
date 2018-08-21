@@ -49,7 +49,13 @@
 (defmethod describe-object ((object function) stream)
   (multiple-value-bind (lambda-expression closure-p name)
       (function-lambda-expression object)
-    (format stream "~S is a ~A" object (if closure-p "closure" "function"))
+    (format stream "~S is a ~A" object
+            (cond (closure-p "closure")
+                  ((mezzano.delimited-continuations:delimited-continuation-p object)
+                   (if (mezzano.delimited-continuations:resumable-p object)
+                       "resumable delimited continuation"
+                       "consumed delimited continuation"))
+                  (t "function")))
     (when name
       (format stream " named ~S" name))
     (format stream "~%")))
@@ -128,10 +134,15 @@
 
 (defmethod describe-object ((object standard-object) stream)
   (format stream "A Closette object~%~
-             Printed representation: ~S~%~
+             Printed representation: ~A~%~
              Class: ~S~%~
              Structure~%"
-          object
+          (handler-case
+              (format nil "~S" object)
+            (error ()
+              (with-output-to-string (s)
+                (print-unreadable-object (object s :type t :identity t)
+                  (format s "<<error printing object>>")))))
           (class-of object))
   (dolist (sn (mapcar #'mezzano.clos:slot-definition-name
                       (mezzano.clos:class-slots (class-of object))))

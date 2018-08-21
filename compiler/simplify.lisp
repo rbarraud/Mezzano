@@ -5,8 +5,11 @@
 
 (in-package :sys.c)
 
-(defun simplify (lambda)
-  (simp-form lambda))
+(defun simplify (lambda architecture)
+  (declare (ignore architecture))
+  (with-metering (:simplify-ast)
+    (detect-uses lambda)
+    (simp-form lambda)))
 
 (defgeneric simp-form (form))
 
@@ -141,7 +144,11 @@
         (typep unwrapped 'ast-function)
         (and (lexical-variable-p unwrapped)
              (localp unwrapped)
-             (eql (lexical-variable-write-count unwrapped) 0)))))
+             (eql (lexical-variable-write-count unwrapped) 0))
+        ;; FIXME: This needs to check the number of arguments.
+        (and (typep unwrapped 'ast-call)
+             (member (ast-name unwrapped) *pure-functions* :test #'equal)
+             (every #'pure-p (ast-arguments unwrapped))))))
 
 (defmethod simp-form ((form ast-let))
   ;; Merge nested LETs when possible, do not merge special bindings!
@@ -622,6 +629,17 @@
     ;; Conversion from single-float to integer.
     (return-from mod-n-transform-candidate-p
       t))
+  (when (or (and (typep value 'ast-call)
+                 (member (name value) '(mezzano.simd:mmx-vector-value mezzano.simd::%mmx-vector-value))
+                 (eql (length (arguments value)) 1)
+                 (match-transform-argument 'mezzano.simd:mmx-vector (first (arguments value))))
+            (and (typep value 'ast-call)
+                 (member (name value) '(mezzano.simd:sse-vector-value mezzano.simd::%sse-vector-value))
+                 (eql (length (arguments value)) 1)
+                 (match-transform-argument 'mezzano.simd:sse-vector (first (arguments value)))))
+    ;; Conversion from mmx/sse--vector to integer.
+    (return-from mod-n-transform-candidate-p
+      t))
   ;; The value must be a call to one of the arithmetic functions.
   ;; Both sides must be fixnums. This will cause the fixnum arithmetic
   ;; transforms to fire, and the calls to be transformed to their
@@ -657,12 +675,141 @@
                                                lhs))))
     form))
 
+(defun simp-array-rank (form)
+  (let* ((array (first (arguments form)))
+         (type (if (typep array 'ast-the)
+                   (ast-the-type array)
+                   't)))
+    (cond ((and (consp type)
+                ;; Arrays never change rank.
+                (member (first type) '(array simple-array)))
+           (let ((dims (nth-value 1 (sys.int::parse-array-type type))))
+             ;; Some kind of array. See if the rank is known.
+             (cond ((listp dims)
+                    ;; It is! Replace with the known length.
+                    (ast `(progn ,array
+                                 ',(length dims))
+                         form))
+                   (t form))))
+          (t
+           form))))
+
+(defun simp-array-dimension (form)
+  (let* ((array (first (arguments form)))
+         (axis (second (arguments form)))
+         (type (if (typep array 'ast-the)
+                   (ast-the-type array)
+                   't)))
+    (cond ((and (typep axis 'ast-quote)
+                (integerp (ast-value axis))
+                (consp type)
+                (member (first type) '(simple-array array)))
+           (multiple-value-bind (element-type dims)
+               (sys.int::parse-array-type type)
+             (let* ((rank (if (listp dims)
+                              (length dims)
+                              -1))
+                    (axis (ast-value axis))
+                    (dim (if (<= 0 axis (1- rank))
+                             (elt dims axis)
+                             nil)))
+               (cond ((integerp dim)
+                      ;; This axis has a known dimension.
+                      (ast `(progn ,array
+                                   ',dim)
+                           form))
+                     ((and (eql dim '*)
+                           (not (eql element-type '*)))
+                      ;; This axis is unknown, but the axis is valid.
+                      (if (and (eql rank 1)
+                               ;; Strings are always complex arrays.
+                               (not (compiler-subtypep element-type 'character)))
+                          (ast `(the fixnum (call sys.int::%object-header-data ,array) form))
+                          (ast `(the fixnum (call sys.int::%object-ref-t
+                                                  ,array
+                                                  ',(+ sys.int::+complex-array-axis-0+ axis)))
+                               form)))
+                   (t form)))))
+          (t
+           form))))
+
+(defun extract-list-like-forms (form)
+  "If FORM is a list-like series of calls, then return the objects that would form the elements of the list.
+First return value is a list of elements, second is the final dotted component (if any)."
+  (setf form (unwrap-the form))
+  (typecase form
+    (ast-call
+     (case (name form)
+       ((list)
+        (values (arguments form) nil))
+       ((list*)
+        (multiple-value-bind (tail-components tail-tail)
+            (extract-list-like-forms (first (last (arguments form))))
+          (values (append (butlast (arguments form))
+                          tail-components)
+                  tail-tail)))
+       ((cons)
+        (multiple-value-bind (tail-components tail-tail)
+            (extract-list-like-forms (second (arguments form)))
+          (values (append (list (first (arguments form)))
+                          tail-components)
+                  tail-tail)))
+       ((copy-list)
+        (extract-list-like-forms (first (arguments form))))
+       (t
+        (values nil form))))
+    (ast-quote
+     (let ((val (ast-value form))
+           (fast (ast-value form))
+           (elts '()))
+       (loop
+          (cond ((null val)
+                 (return (values (reverse elts) nil)))
+                ((not (consp val))
+                 (return (values (reverse elts)
+                                 (ast `(quote ,val) form))))
+                ((and elts (eql fast val))
+                 ;; Slow pointer met fast pointer, this is a circular list.
+                 ;; Give up.
+                 (return (values nil form)))
+                (t
+                 ;; Cons, accumulate elements.
+                 (push (ast `(quote ,(first val)) form) elts)
+                 (setf val (rest val))
+                 ;; Check for circular lists.
+                 (when (consp fast)
+                   (setf fast (rest fast))
+                   (when (consp fast)
+                     (setf fast (rest fast)))))))))
+    (t
+     (values nil form))))
+
+(defun simp-%apply (form)
+  (multiple-value-bind (list-body list-tail)
+      (extract-list-like-forms (second (arguments form)))
+    (cond ((not list-tail)
+           ;; (%apply foo (list ...)) => (%funcall foo ...)
+           (change-made)
+           (setf (name form) 'mezzano.runtime::%funcall
+                 (arguments form) (append (list (first (arguments form)))
+                                          list-body))
+           (simp-form form))
+          (t form))))
+
 (defmethod simp-form ((form ast-call))
   (simp-form-list (arguments form))
   (cond ((eql (name form) 'eql)
          (simp-eql form))
         ((eql (name form) 'ash)
          (simp-ash form))
+        ((and (eql (name form) 'array-rank)
+              (eql (length (arguments form)) 1)
+              (match-optimize-settings form '((= safety 0) (= speed 3))))
+         (simp-array-rank form))
+        ((and (eql (name form) 'array-dimension)
+              (eql (length (arguments form)) 2)
+              (match-optimize-settings form '((= safety 0) (= speed 3))))
+         (simp-array-dimension form))
         ((and (member (name form) '(sys.int::binary-logand %fast-fixnum-logand))
               (eql (length (arguments form)) 2)
               (match-optimize-settings form '((= safety 0) (= speed 3))))
@@ -689,14 +836,8 @@
          (first (arguments form)))
         ;; (%apply #'foo (list ...)) => (foo ...)
         ((and (eql (name form) 'mezzano.runtime::%apply)
-              (eql (length (arguments form)) 2)
-              (typep (unwrap-the (first (arguments form))) 'ast-function)
-              (typep (second (arguments form)) 'ast-call)
-              (eql (name (second (arguments form))) 'list))
-         (change-made)
-         (setf (name form) (ast-name (unwrap-the (first (arguments form))))
-               (arguments form) (arguments (second (arguments form))))
-         (simp-form form))
+              (eql (length (arguments form)) 2))
+         (simp-%apply form))
         ;; (%funcall #'name ...) -> (name ...)
         ((and (eql (name form) 'mezzano.runtime::%funcall)
               (typep (unwrap-the (first (arguments form))) 'ast-function))
@@ -712,6 +853,30 @@
                      (call sys.int::%coerce-to-callable
                            ,(first (arguments form)))
                      ,@(rest (arguments form)))
+              form))
+        ;; (list) => NIL
+        ((and (eql (name form) 'list)
+              (endp (arguments form)))
+         (change-made)
+         (ast `(quote nil) form))
+        ;; (list x . y) => (cons x (list . y))
+        ((and (eql (name form) 'list)
+              (arguments form))
+         (change-made)
+         (ast `(call cons ,(first (arguments form))
+                     (call list ,@(rest (arguments form))))
+              form))
+        ;; (list* x) => x
+        ((and (eql (name form) 'list*)
+              (endp (rest (arguments form))))
+         (change-made)
+         (first (arguments form)))
+        ;; (list* x . y) => (cons x (list* . y))
+        ((and (eql (name form) 'list)
+              (rest (arguments form)))
+         (change-made)
+         (ast `(call cons ,(first (arguments form))
+                     (call list ,@(rest (arguments form))))
               form))
         (t
          ;; Rewrite (foo ... ([progn,let] x y) ...) to ([progn,let] x (foo ... y ...)) when possible.
@@ -752,7 +917,13 @@
 (defmethod simp-form ((form ast-jump-table))
   (setf (value form) (simp-form (value form)))
   (setf (targets form) (mapcar #'simp-form (targets form)))
-  form)
+  (cond ((and (typep (value form) 'ast-quote)
+              (typep (value (value form)) 'integer)
+              (<= 0 (value (value form)) (1- (length (targets form)))))
+         (change-made)
+         (elt (targets form) (value (value form))))
+        (t
+         form)))
 
 (defmethod simp-form ((form lexical-variable))
   form)

@@ -51,7 +51,7 @@
   (ensure-class-finalized class)
   (allocate-std-instance
     class
-    (allocate-slot-storage (count-if #'instance-slot-p (class-slots class))
+    (allocate-slot-storage (length (class-slot-storage-layout class))
                            *secret-unbound-value*)
     (class-slot-storage-layout class)))
 
@@ -62,7 +62,7 @@
      (declare (ignore x))
      (error "The function of this funcallable instance has not been set."))
     class
-    (allocate-slot-storage (count-if #'instance-slot-p (class-slots class))
+    (allocate-slot-storage (length (class-slot-storage-layout class))
                            *secret-unbound-value*)
     (class-slot-storage-layout class)))
 
@@ -82,12 +82,17 @@
 
 (sys.int::defglobal *the-class-standard-class*)    ;standard-class's class metaobject
 (sys.int::defglobal *the-class-funcallable-standard-class*)
+(sys.int::defglobal *the-class-built-in-class*)
 (sys.int::defglobal *the-class-standard-direct-slot-definition*)
 (sys.int::defglobal *the-class-standard-effective-slot-definition*)
 (sys.int::defglobal *the-class-t*)
 (sys.int::defglobal *standard-class-effective-slots-position*) ; Position of the effective-slots slot in standard-class.
 (sys.int::defglobal *standard-class-slot-storage-layout-position*)
 (sys.int::defglobal *standard-class-hash-position*)
+(sys.int::defglobal *standard-class-finalized-p-position*)
+(sys.int::defglobal *standard-class-precedence-list-position*)
+(sys.int::defglobal *standard-class-direct-default-initargs-position*)
+(sys.int::defglobal *standard-class-default-initargs-position*)
 
 (defun slot-location (class slot-name)
   (if (and (eq slot-name 'effective-slots)
@@ -123,9 +128,9 @@
       (sys.int::cas (svref slots location) old new)))
 
 (defun fast-sv-position (value simple-vector)
-  (dotimes (i (array-dimension simple-vector 0))
-    (when (eq value (svref simple-vector i))
-      (return i))))
+  (declare (optimize speed (safety 0) (debug 1))
+           (type simple-vector simple-vector))
+  (position value simple-vector :test #'eq))
 
 (defun fast-slot-read (instance location)
   (multiple-value-bind (slots layout)
@@ -135,7 +140,9 @@
       (if (eq *secret-unbound-value* val)
           (values (slot-unbound (class-of instance)
                                 instance
-                                (slot-definition-name (elt (class-slots (class-of instance)) location))))
+                                (if (consp location)
+                                    (car location)
+                                    (slot-definition-name (elt (class-slots (class-of instance)) location)))))
           val))))
 
 (defun fast-slot-write (new-value instance location)
@@ -196,6 +203,48 @@
                (slot-value-using-class (class-of object) object slot)
                (values (slot-missing (class-of object) object slot-name 'slot-value)))))))
 
+(defparameter *fast-slot-value-readers* (make-hash-table))
+
+(defun fast-slot-value-reader (slot-name)
+  (let ((gf (gethash slot-name *fast-slot-value-readers*)))
+    (when (not gf)
+      (setf gf (make-instance 'standard-generic-function
+                              :name `(slot-value ,slot-name)
+                              :lambda-list '(object)
+                              :method-class (find-class 'standard-method)))
+      ;; Add methods for both standard-object and structure-object to force
+      ;; the discriminator to take the 1-effective path instead of the
+      ;; unspecialized path.
+      (add-method gf
+                  (make-instance 'standard-reader-method
+                                 :lambda-list '(object)
+                                 :qualifiers ()
+                                 :specializers (list (find-class 'standard-object))
+                                 :function (lambda (method next-emfun)
+                                             (declare (ignore method next-emfun))
+                                             (lambda (object)
+                                               (slot-value object slot-name)))
+                                 :slot-definition slot-name))
+      (add-method gf
+                  (make-instance 'standard-reader-method
+                                 :lambda-list '(object)
+                                 :qualifiers ()
+                                 :specializers (list (find-class 'structure-object))
+                                 :function (lambda (method next-emfun)
+                                             (declare (ignore method next-emfun))
+                                             (lambda (object)
+                                               (slot-value object slot-name)))
+                                 :slot-definition slot-name))
+      (setf (gethash slot-name *fast-slot-value-readers*) gf))
+    gf))
+
+(define-compiler-macro slot-value (&whole whole object slot-name)
+  (cond ((typep slot-name '(cons (eql quote) (cons symbol null)))
+         `(funcall (load-time-value (fast-slot-value-reader ,slot-name))
+                   ,object))
+        (t
+         whole)))
+
 (defun (setf std-slot-value) (value instance slot-name)
   (multiple-value-bind (slots location)
       (slot-location-in-instance instance slot-name)
@@ -214,6 +263,46 @@
                  (t
                   (slot-missing (class-of object) object slot-name 'setf new-value)
                   new-value))))))
+
+(defparameter *fast-slot-value-writers* (make-hash-table))
+
+(defun fast-slot-value-writer (slot-name)
+  (let ((gf (gethash slot-name *fast-slot-value-writers*)))
+    (when (not gf)
+      (setf gf (make-instance 'standard-generic-function
+                              :name `((setf slot-value) ,slot-name)
+                              :lambda-list '(value object)
+                              :method-class (find-class 'standard-method)))
+      (add-method gf
+                  (make-instance 'standard-writer-method
+                                 :lambda-list '(value object)
+                                 :qualifiers ()
+                                 :specializers (list *the-class-t* (find-class 'standard-object))
+                                 :function (lambda (method next-emfun)
+                                             (declare (ignore method next-emfun))
+                                             (lambda (value object)
+                                               (setf (slot-value object slot-name) value)))
+                                 :slot-definition slot-name))
+      (add-method gf
+                  (make-instance 'standard-writer-method
+                                 :lambda-list '(value object)
+                                 :qualifiers ()
+                                 :specializers (list *the-class-t* (find-class 'structure-object))
+                                 :function (lambda (method next-emfun)
+                                             (declare (ignore method next-emfun))
+                                             (lambda (value object)
+                                               (setf (slot-value object slot-name) value)))
+                                 :slot-definition slot-name))
+      (setf (gethash slot-name *fast-slot-value-writers*) gf))
+    gf))
+
+(define-compiler-macro (setf slot-value) (&whole whole value object slot-name)
+  (cond ((typep slot-name '(cons (eql quote) (cons symbol null)))
+         `(funcall (load-time-value (fast-slot-value-writer ,slot-name))
+                   ,value
+                   ,object))
+        (t
+         whole)))
 
 (defun (sys.int::cas std-slot-value) (old new instance slot-name)
   (multiple-value-bind (slots location)
@@ -280,9 +369,9 @@
 
 (defun class-of (x)
   (cond ((std-instance-p x)
-         (std-instance-class x))
+         (sys.int::%object-ref-t x sys.int::+std-instance-class+))
         ((funcallable-std-instance-p x)
-         (funcallable-std-instance-class x))
+         (sys.int::%object-ref-t x sys.int::+funcallable-instance-class+))
         (t (built-in-class-of x))))
 
 (defun canonicalize-struct-slot (slot)
@@ -335,11 +424,15 @@
     (simple-vector                                 (find-class-cached 'simple-vector))
     (vector                                        (find-class-cached 'vector))
     (array                                         (find-class-cached 'array))
+    (mezzano.delimited-continuations:delimited-continuation
+     (find-class-cached 'mezzano.delimited-continuations:delimited-continuation))
     (function                                      (find-class-cached 'function))
     (mezzano.supervisor:thread                     (find-class-cached 'mezzano.supervisor:thread))
     (sys.int::function-reference                   (find-class-cached 'sys.int::function-reference))
     (sys.int::weak-pointer                         (find-class-cached 'sys.int::weak-pointer))
     (byte                                          (find-class-cached 'byte))
+    (mezzano.simd:mmx-vector                       (find-class-cached 'mezzano.simd:mmx-vector))
+    (mezzano.simd:sse-vector                       (find-class-cached 'mezzano.simd:sse-vector))
     (structure-object
      (class-of-structure-definition (sys.int::%struct-slot x 0)))
     (t                                             (find-class-cached 't))))
@@ -360,65 +453,114 @@
 (defun class-name (class)
   (std-slot-value class 'name))
 (defun (setf class-name) (new-value class)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value class 'name) new-value))
 
 (defun class-direct-superclasses (class)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (slot-value class 'direct-superclasses))
 (defun (setf class-direct-superclasses) (new-value class)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value class 'direct-superclasses) new-value))
 
 (defun class-direct-slots (class)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (slot-value class 'direct-slots))
 (defun (setf class-direct-slots) (new-value class)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value class 'direct-slots) new-value))
 
 (defun class-precedence-list (class)
-  (slot-value class 'class-precedence-list))
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
+  (let ((class-of-class (class-of class)))
+    (cond ((std-class-p class-of-class)
+           (svref (std-instance-slots class) *standard-class-precedence-list-position*))
+          (t
+           (slot-value class 'class-precedence-list)))))
 (defun (setf class-precedence-list) (new-value class)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value class 'class-precedence-list) new-value))
 
 (defun class-slots (class)
-  (slot-value class 'effective-slots))
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
+  (let ((class-of-class (class-of class)))
+    (cond ((clos-class-p class-of-class)
+           (svref (std-instance-slots class) *standard-class-effective-slots-position*))
+          (t (slot-value class 'effective-slots)))))
 (defun (setf class-slots) (new-value class)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value class 'effective-slots) new-value))
 
 (defun class-slot-storage-layout (class)
-  (slot-value class 'slot-storage-layout))
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
+  (let ((class-of-class (class-of class)))
+    (cond ((clos-class-p class-of-class)
+           (svref (std-instance-slots class) *standard-class-slot-storage-layout-position*))
+          (t (slot-value class 'slot-storage-layout)))))
 (defun (setf class-slot-storage-layout) (new-value class)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value class 'slot-storage-layout) new-value))
 
 (defun class-direct-subclasses (class)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (slot-value class 'direct-subclasses))
 (defun (setf class-direct-subclasses) (new-value class)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value class 'direct-subclasses) new-value))
 
 (defun class-direct-methods (class)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (slot-value class 'direct-methods))
 (defun (setf class-direct-methods) (new-value class)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value class 'direct-methods) new-value))
 
 (defun class-direct-default-initargs (class)
-  (slot-value class 'direct-default-initargs))
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
+  (let ((class-of-class (class-of class)))
+    (cond ((clos-class-p class-of-class)
+           (svref (std-instance-slots class) *standard-class-direct-default-initargs-position*))
+          (t (slot-value class 'direct-default-initargs)))))
 (defun (setf class-direct-default-initargs) (new-value class)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value class 'direct-default-initargs) new-value))
 
 (defun class-dependents (class)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (std-slot-value class 'dependents))
 (defun (setf class-dependents) (new-value class)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value class 'dependents) new-value))
 
 (defun class-hash (class)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (let ((class-of-class (class-of class)))
-    (cond ((std-class-p class-of-class)
+    (cond ((clos-class-p class-of-class)
            (svref (std-instance-slots class) *standard-class-hash-position*))
           (t (std-slot-value class 'hash)))))
 (defun (setf class-hash) (new-value class)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value class 'hash) new-value))
 
 (defun class-finalized-p (class)
-  (std-slot-value class 'finalized-p))
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
+  (let ((class-of-class (class-of class)))
+    (cond ((clos-class-p class-of-class)
+           (svref (std-instance-slots class) *standard-class-finalized-p-position*))
+          (t (std-slot-value class 'finalized-p)))))
 (defun (setf class-finalized-p) (new-value class)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value class 'finalized-p) new-value))
+
+(defun class-default-initargs (class)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
+  (let ((class-of-class (class-of class)))
+    (cond ((clos-class-p class-of-class)
+           (svref (std-instance-slots class) *standard-class-default-initargs-position*))
+          (t (slot-value class 'default-initargs)))))
+(defun (setf class-default-initargs) (new-value class)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
+  (setf (slot-value class 'default-initargs) new-value))
 
 ;;; Ensure class
 
@@ -471,8 +613,14 @@ Other arguments are included directly."
 
 (defun std-class-p (metaclass)
   "Returns true if METACLASS is either STANDARD-CLASS or FUNCALLABLE-STANDARD-CLASS."
-  (or (eql metaclass *the-class-standard-class*)
-      (eql metaclass *the-class-funcallable-standard-class*)))
+  (or (eq metaclass *the-class-standard-class*)
+      (eq metaclass *the-class-funcallable-standard-class*)))
+
+(defun clos-class-p (metaclass)
+  "Returns true if METACLASS is either STANDARD-CLASS, FUNCALLABLE-STANDARD-CLASS, or BUILT-IN-CLASS."
+  (or (eq metaclass *the-class-standard-class*)
+      (eq metaclass *the-class-funcallable-standard-class*)
+      (eq metaclass *the-class-built-in-class*)))
 
 (defun convert-to-direct-slot-definition (class canonicalized-slot)
   (apply #'make-instance
@@ -520,53 +668,73 @@ Other arguments are included directly."
 ;;; Slot definition metaobjects
 
 (defun slot-definition-name (slot)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (slot-value slot 'name))
 (defun (setf slot-definition-name) (new-value slot)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value slot 'name) new-value))
 
 (defun slot-definition-initfunction (slot)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (slot-value slot 'initfunction))
 (defun (setf slot-definition-initfunction) (new-value slot)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value slot 'initfunction) new-value))
 
 (defun slot-definition-initform (slot)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (slot-value slot 'initform))
 (defun (setf slot-definition-initform) (new-value slot)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value slot 'initform) new-value))
 
 (defun slot-definition-initargs (slot)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (slot-value slot 'initargs))
 (defun (setf slot-definition-initargs) (new-value slot)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value slot 'initargs) new-value))
 
 (defun slot-definition-readers (slot)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (slot-value slot 'readers))
 (defun (setf slot-definition-readers) (new-value slot)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value slot 'readers) new-value))
 
 (defun slot-definition-writers (slot)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (slot-value slot 'writers))
 (defun (setf slot-definition-writers) (new-value slot)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value slot 'writers) new-value))
 
 (defun slot-definition-allocation (slot)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (slot-value slot 'allocation))
 (defun (setf slot-definition-allocation) (new-value slot)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value slot 'allocation) new-value))
 
 (defun slot-definition-location (slot)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (slot-value slot 'location))
 (defun (setf slot-definition-location) (new-value slot)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value slot 'location) new-value))
 
 (defun slot-definition-type (slot)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (slot-value slot 'type))
 (defun (setf slot-definition-type) (new-value slot)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value slot 'type) new-value))
 
 (defun slot-definition-documentation (slot)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (slot-value slot 'documentation))
 (defun (setf slot-definition-documentation) (new-value slot)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value slot 'documentation) new-value))
 
 ;;; finalize-inheritance
@@ -576,6 +744,7 @@ Other arguments are included directly."
     (ensure-class-finalized super))
   (setf (class-precedence-list class) (compute-class-precedence-list class))
   (setf (class-slots class) (compute-slots class))
+  (setf (class-default-initargs class) (compute-default-initargs class))
   (let* ((instance-slots (remove-if-not 'instance-slot-p
                                         (class-slots class)))
          (layout (make-array (length instance-slots))))
@@ -670,17 +839,22 @@ Other arguments are included directly."
                                    (class-direct-slots super)
                                    :key #'slot-definition-name)))
                (when existing
-                 (cond ((eql super class)
-                        ;; This class defines the direct slot. Create a new cell to hold the value.
-                        ;; (FIXME: Need to preserve the location over class redefinition.)
-                        (setf (slot-definition-location slot) (cons (slot-definition-name slot) *secret-unbound-value*)))
-                       (t
-                        (let ((existing-effective (find (slot-definition-name slot)
-                                                        (class-slots super)
-                                                        :key #'slot-definition-name)))
+                 (let ((existing-effective (find (slot-definition-name slot)
+                                                 (class-slots super)
+                                                 :key #'slot-definition-name)))
+                   (cond ((eql super class)
+                          ;; This class defines the direct
+                          ;; slot. Create a new cell to hold the
+                          ;; value, or preserve the existing one if
+                          ;; the class is being redefined.
+                          (setf (slot-definition-location slot)
+                                (if existing-effective
+                                    (slot-definition-location existing-effective)
+                                    (cons (slot-definition-name slot) *secret-unbound-value*))))
+                         (t
                           (assert (consp (slot-definition-location existing-effective)))
-                          (setf (slot-definition-location slot) (slot-definition-location existing-effective)))))
-                 (return)))))
+                          (setf (slot-definition-location slot) (slot-definition-location existing-effective))))
+                   (return))))))
           (t
            (setf (slot-definition-location slot) nil)))))
 
@@ -713,65 +887,89 @@ Other arguments are included directly."
 (sys.int::defglobal *the-class-standard-gf*) ;standard-generic-function's class metaobject
 
 (defun generic-function-name (gf)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (slot-value gf 'name))
 (defun (setf generic-function-name) (new-value gf)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value gf 'name) new-value))
 
 (defun generic-function-lambda-list (gf)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (slot-value gf 'lambda-list))
 (defun (setf generic-function-lambda-list) (new-value gf)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value gf 'lambda-list) new-value))
 
 (defun generic-function-methods (gf)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (slot-value gf 'methods))
 (defun (setf generic-function-methods) (new-value gf)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value gf 'methods) new-value))
 
 (defun generic-function-discriminating-function (gf)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (slot-value gf 'discriminating-function))
 (defun (setf generic-function-discriminating-function) (new-value gf)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value gf 'discriminating-function) new-value))
 
 (defun generic-function-method-class (gf)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (slot-value gf 'method-class))
 (defun (setf generic-function-method-class) (new-value gf)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value gf 'method-class) new-value))
 
 (defun generic-function-relevant-arguments (gf)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (slot-value gf 'relevant-arguments))
 (defun (setf generic-function-relevant-arguments) (new-value gf)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value gf 'relevant-arguments) new-value))
 
 (defun generic-function-has-unusual-specializers (gf)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (slot-value gf 'weird-specializers-p))
 (defun (setf generic-function-has-unusual-specializers) (new-value gf)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value gf 'weird-specializers-p) new-value))
 
 (defun generic-function-method-combination (gf)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (slot-value gf 'method-combination))
 (defun (setf generic-function-method-combination) (new-value gf)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value gf 'method-combination) new-value))
 
 (defun generic-function-argument-precedence-order (gf)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (slot-value gf 'argument-precedence-order))
 (defun (setf generic-function-argument-precedence-order) (new-value gf)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value gf 'argument-precedence-order) new-value))
 
 (defun generic-function-declarations (gf)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (slot-value gf 'declarations))
 (defun (setf generic-function-declarations) (new-value gf)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value gf 'declarations) new-value))
 
 ;;; Internal accessor for effective method function table
 
 (defun classes-to-emf-table (gf)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (slot-value gf 'classes-to-emf-table))
 (defun (setf classes-to-emf-table) (new-value gf)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value gf 'classes-to-emf-table) new-value))
 
 (defun argument-reordering-table (gf)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (slot-value gf 'argument-reordering-table))
 (defun (setf argument-reordering-table) (value gf)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value gf 'argument-reordering-table) value))
 
 ;;;
@@ -780,25 +978,39 @@ Other arguments are included directly."
 
 (sys.int::defglobal *the-class-standard-method*)    ;standard-method's class metaobject
 
-(defun method-lambda-list (method) (slot-value method 'lambda-list))
+(defun method-lambda-list (method)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
+  (slot-value method 'lambda-list))
 (defun (setf method-lambda-list) (new-value method)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value method 'lambda-list) new-value))
 
-(defun method-qualifiers (method) (slot-value method 'qualifiers))
+(defun method-qualifiers (method)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
+  (slot-value method 'qualifiers))
 (defun (setf method-qualifiers) (new-value method)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value method 'qualifiers) new-value))
 
-(defun method-specializers (method) (slot-value method 'specializers))
+(defun method-specializers (method)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
+  (slot-value method 'specializers))
 (defun (setf method-specializers) (new-value method)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value method 'specializers) new-value))
 
 (defun method-generic-function (method)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (slot-value method 'generic-function))
 (defun (setf method-generic-function) (new-value method)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value method 'generic-function) new-value))
 
-(defun method-function (method) (slot-value method 'function))
+(defun method-function (method)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
+  (slot-value method 'function))
 (defun (setf method-function) (new-value method)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (setf (slot-value method 'function) new-value))
 
 ;;; ensure-generic-function
@@ -844,11 +1056,21 @@ Other arguments are included directly."
            (setf (fdefinition function-name) gf)
            gf))))
 
+(defun generic-function-unspecialized-dispatch-p (gf)
+  "Returns true when the generic function has no methods with non-t specialized arguments."
+  (and (eq (class-of gf) *the-class-standard-gf*)
+       (every (lambda (method)
+                (every (lambda (spec)
+                         (eql spec *the-class-t*))
+                       (method-specializers method)))
+              (generic-function-methods gf))))
+
 (defun generic-function-single-dispatch-p (gf)
   "Returns true when the generic function only one non-t specialized argument and
 has only has class specializer."
   (when (and (eq (class-of gf) *the-class-standard-gf*)
-             (not (generic-function-has-unusual-specializers gf)))
+             (or (not (generic-function-has-unusual-specializers gf))
+                 (eql (generic-function-has-unusual-specializers gf) :eql)))
     (let ((specializers (generic-function-relevant-arguments gf))
           (count 0)
           (offset 0))
@@ -874,12 +1096,13 @@ has only has class specializer."
             (setf (class-dependents class) (remove gf (class-dependents class))))
           (classes-to-emf-table gf))
          (clear-single-dispatch-emf-table (classes-to-emf-table gf)))
-        (t (loop
-              for classes being the hash-keys in (classes-to-emf-table gf)
-              do (loop
-                    for class in classes
-                    do (setf (class-dependents class) (remove gf (class-dependents class)))))
-           (clrhash (classes-to-emf-table gf)))))
+        ((classes-to-emf-table gf)
+         (loop
+            for classes being the hash-keys in (classes-to-emf-table gf)
+            do (loop
+                  for class in classes
+                  do (setf (class-dependents class) (remove gf (class-dependents class)))))
+         (clrhash (classes-to-emf-table gf)))))
 
 (defun required-portion (gf args)
   (let ((number-required (length (gf-required-arglist gf))))
@@ -942,15 +1165,22 @@ has only has class specializer."
       (do ((i 0 (1+ i))
            (spec (method-specializers m) (rest spec)))
           ((null spec))
-        (unless (typep (first spec) 'class)
-          (setf (generic-function-has-unusual-specializers gf) t))
+        (typecase (first spec)
+          (class)
+          (eql-specializer
+           (setf (generic-function-has-unusual-specializers gf) (or (generic-function-has-unusual-specializers gf)
+                                                                    :eql)))
+          (t
+           (setf (generic-function-has-unusual-specializers gf) t)))
         (unless (eql (first spec) class-t)
           (setf (bit relevant-args i) 1))))
     (setf (generic-function-relevant-arguments gf) relevant-args))
   (reset-gf-emf-table gf)
-  (setf (classes-to-emf-table gf) (if (generic-function-single-dispatch-p gf)
-                                      (make-single-dispatch-emf-table)
-                                      (make-hash-table :test #'equal)))
+  (setf (classes-to-emf-table gf) (cond ((generic-function-single-dispatch-p gf)
+                                         (make-single-dispatch-emf-table))
+                                        ((generic-function-unspecialized-dispatch-p gf)
+                                         nil)
+                                        (t (make-hash-table :test #'equal))))
   (setf (generic-function-discriminating-function gf)
         (funcall (if (eq (class-of gf) *the-class-standard-gf*)
                      #'std-compute-discriminating-function
@@ -1159,51 +1389,69 @@ has only has class specializer."
           (slow-single-dispatch-method-lookup* gf argument-offset (list new-value object) :writer)))))
 
 (defun compute-1-effective-discriminator (gf emf-table argument-offset)
-  ;; Generate specialized dispatch functions for various combinations of
-  ;; arguments.
-  (macrolet ((gen-one (index n-required restp)
-               (let ((req-args (loop
-                                  for i below n-required
-                                  collect (gensym)))
-                     (rest-arg (when restp
-                                 (gensym))))
-                 `(when (and (eql ',index argument-offset)
-                             (eql (length (gf-required-arglist gf)) ',n-required)
-                             (eql (length (gf-optional-arglist gf)) '0)
-                             (or (and ',restp (gf-rest-arg-p gf))
-                                 (and (not ',restp) (not (gf-rest-arg-p gf)))))
-                    (lambda (,@req-args ,@(if rest-arg
-                                              `(&rest ,rest-arg)
-                                              '()))
-                      (declare (sys.int::lambda-name (1-effective-discriminator ,index ,n-required ,restp)))
-                      (let* ((class (class-of ,(nth index req-args)))
-                             (emfun (single-dispatch-emf-entry emf-table class)))
-                        (if emfun
-                            ,(if rest-arg
-                                 `(apply emfun ,@req-args ,rest-arg)
-                                 `(funcall emfun ,@req-args))
-                            (slow-single-dispatch-method-lookup
-                             gf
-                             ,(if rest-arg
-                                  `(list* ,@req-args ,rest-arg)
-                                  `(list ,@req-args))
-                             class)))))))
-             (gen-all ()
-               `(or
-                 ,@(loop
-                      for idx from 0 below 5
-                      appending
-                        (loop
-                           for req from 1 to 5
-                           collect `(gen-one ,idx ,req nil)
-                           collect `(gen-one ,idx ,req t))))))
-    (or (gen-all)
-        (lambda (&rest args)
-          (let* ((class (class-of (nth argument-offset args)))
-                 (emfun (single-dispatch-emf-entry emf-table class)))
-            (if emfun
-                (apply emfun args)
-                (slow-single-dispatch-method-lookup gf args class)))))))
+  (let ((eql-table (compute-1-effective-eql-table gf argument-offset)))
+    ;; Generate specialized dispatch functions for various combinations of
+    ;; arguments.
+    (macrolet ((gen-one (index n-required restp eql-spec-p)
+                 (let ((req-args (loop
+                                    for i below n-required
+                                    collect (gensym)))
+                       (rest-arg (when restp
+                                   (gensym))))
+                   `(when (and (eql ',index argument-offset)
+                               (eql (length (gf-required-arglist gf)) ',n-required)
+                               (or (and ',restp (or (gf-optional-arglist gf)
+                                                    (gf-rest-arg-p gf)))
+                                   (and (not ',restp) (not (or (gf-optional-arglist gf)
+                                                               (gf-rest-arg-p gf)))))
+                               ,(if eql-spec-p
+                                    'eql-table
+                                    `(not eql-table)))
+                      (lambda (,@req-args ,@(if rest-arg
+                                                `(&rest ,rest-arg)
+                                                '()))
+                        (declare (sys.int::lambda-name (1-effective-discriminator ,index ,n-required ,restp ,eql-spec-p))
+                                 ,@(if rest-arg
+                                       `((dynamic-extent ,rest-arg))
+                                       `()))
+                        (block nil
+                          ,(when eql-spec-p
+                             `(let ((eql-emfun (assoc ,(nth index req-args) eql-table)))
+                                (when eql-emfun
+                                  (return ,(if rest-arg
+                                               `(apply (cdr eql-emfun) ,@req-args ,rest-arg)
+                                               `(funcall (cdr eql-emfun) ,@req-args))))))
+                          (let* ((class (class-of ,(nth index req-args)))
+                                 (emfun (single-dispatch-emf-entry emf-table class)))
+                            (if emfun
+                                ,(if rest-arg
+                                     `(apply emfun ,@req-args ,rest-arg)
+                                     `(funcall emfun ,@req-args))
+                                (slow-single-dispatch-method-lookup
+                                 gf
+                                 ,(if rest-arg
+                                      `(list* ,@req-args ,rest-arg)
+                                      `(list ,@req-args))
+                                 class))))))))
+               (gen-all ()
+                 `(or
+                   ,@(loop
+                        for idx from 0 below 5
+                        appending
+                          (loop
+                             for req from 1 to 5
+                             collect `(gen-one ,idx ,req nil nil)
+                             collect `(gen-one ,idx ,req nil t)
+                             collect `(gen-one ,idx ,req t   nil)
+                             collect `(gen-one ,idx ,req t   t))))))
+      (or (gen-all)
+          (lambda (&rest args)
+            (declare (dynamic-extent args))
+            (let* ((class (class-of (nth argument-offset args)))
+                   (emfun (single-dispatch-emf-entry emf-table class)))
+              (if emfun
+                  (apply emfun args)
+                  (slow-single-dispatch-method-lookup gf args class))))))))
 
 (defun compute-n-effective-discriminator (gf emf-table n-required-args)
   (lambda (&rest args)
@@ -1217,7 +1465,22 @@ has only has class specializer."
           (apply emfun args)
           (slow-method-lookup gf args classes)))))
 
+(defun compute-1-effective-eql-table (gf argument-offset)
+  (loop
+     with n-required = (length (gf-required-arglist gf))
+     for method in (generic-function-methods gf)
+     for spec = (elt (method-specializers method) argument-offset)
+     when (typep spec 'eql-specializer)
+     collect (cons (eql-specializer-object spec)
+                   (std-compute-effective-method-function
+                    gf
+                    (compute-applicable-methods gf
+                                                (loop
+                                                   repeat n-required
+                                                   collect (eql-specializer-object spec)))))))
+
 (defun slow-single-dispatch-method-lookup* (gf argument-offset args state)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (let ((emf-table (classes-to-emf-table gf)))
     (ecase state
       (:reader
@@ -1230,13 +1493,16 @@ has only has class specializer."
          (cond ((and (not (null applicable-methods))
                      (every 'primary-method-p applicable-methods)
                      (typep (first applicable-methods) 'standard-reader-method)
-                     (std-class-p (class-of class))
-                     (slot-exists-in-class-p class (slot-value (first applicable-methods) 'slot-definition)))
-                (let ((location (slot-location class (slot-value (first applicable-methods) 'slot-definition))))
-                  (assert location)
-                  (setf (single-dispatch-emf-entry emf-table class) location)
-                  (pushnew gf (class-dependents class))
-                  (fast-slot-read (first args) location)))
+                     (std-class-p (class-of class)))
+                (cond ((slot-exists-in-class-p class (slot-value (first applicable-methods) 'slot-definition))
+                       (let ((location (slot-location class (slot-value (first applicable-methods) 'slot-definition))))
+                         (assert location)
+                         (setf (single-dispatch-emf-entry emf-table class) location)
+                         (pushnew gf (class-dependents class))
+                         (fast-slot-read (first args) location)))
+                      (t
+                       ;; Slot not present, fall back on SLOT-VALUE.
+                       (slot-value (first args) (slot-value (first applicable-methods) 'slot-definition)))))
                (t ;; Give up and use the full path.
                 (slow-single-dispatch-method-lookup* gf argument-offset args :never-called)))))
       (:writer
@@ -1249,23 +1515,25 @@ has only has class specializer."
          (cond ((and (not (null applicable-methods))
                      (every 'primary-method-p applicable-methods)
                      (typep (first applicable-methods) 'standard-writer-method)
-                     (std-class-p (class-of class))
-                     (slot-exists-in-class-p class (slot-value (first applicable-methods) 'slot-definition)))
-                (let ((location (slot-location class (slot-value (first applicable-methods) 'slot-definition))))
-                  (assert location)
-                  (setf (single-dispatch-emf-entry emf-table class) location)
-                  (pushnew gf (class-dependents class))
-                  (fast-slot-write (first args) (second args) location)))
+                     (std-class-p (class-of class)))
+                (cond ((slot-exists-in-class-p class (slot-value (first applicable-methods) 'slot-definition))
+                       (let ((location (slot-location class (slot-value (first applicable-methods) 'slot-definition))))
+                         (assert location)
+                         (setf (single-dispatch-emf-entry emf-table class) location)
+                         (pushnew gf (class-dependents class))
+                         (fast-slot-write (first args) (second args) location)))
+                      (t
+                       ;; Slot not present, fall back on SLOT-VALUE.
+                       (setf (slot-value (second args) (slot-value (first applicable-methods) 'slot-definition)) (first args)))))
                (t ;; Give up and use the full path.
                 (slow-single-dispatch-method-lookup* gf argument-offset args :never-called)))))
       (:never-called
        (reset-gf-emf-table gf)
        (let* ((classes (mapcar #'class-of (required-portion gf args)))
               (class (nth argument-offset classes))
-              (applicable-methods
-               (if (eql (class-of gf) *the-class-standard-gf*)
-                   (std-compute-applicable-methods-using-classes gf classes)
-                   (compute-applicable-methods-using-classes gf classes))))
+              (applicable-methods (if (eql (class-of gf) *the-class-standard-gf*)
+                                      (std-compute-applicable-methods-using-classes gf classes)
+                                      (compute-applicable-methods-using-classes gf classes))))
          (cond ((and (not (null applicable-methods))
                      (every 'primary-method-p applicable-methods)
                      (typep (first applicable-methods) 'standard-reader-method)
@@ -1296,6 +1564,8 @@ has only has class specializer."
         (generic-function-single-dispatch-p gf)
       (cond (single-dispatch-p
              (slow-single-dispatch-method-lookup* gf argument-offset args :never-called))
+            ((generic-function-unspecialized-dispatch-p gf)
+             (slow-unspecialized-dispatch-method-lookup gf args))
             (t (setf (generic-function-discriminating-function gf)
                      (compute-n-effective-discriminator gf (classes-to-emf-table gf) (length (gf-required-arglist gf))))
                (set-funcallable-instance-function gf (generic-function-discriminating-function gf))
@@ -1327,20 +1597,39 @@ has only has class specializer."
       (apply emfun args))))
 
 (defun slow-single-dispatch-method-lookup (gf args class)
-  (let* ((classes (mapcar #'class-of
-                          (required-portion gf args)))
-         (applicable-methods
-          (if (eql (class-of gf) *the-class-standard-gf*)
-              (std-compute-applicable-methods-using-classes gf classes)
-              (compute-applicable-methods-using-classes gf classes))))
-    (let ((emfun (cond (applicable-methods
+  (let* ((classes (mapcar #'class-of (required-portion gf args))))
+    (multiple-value-bind (applicable-methods validp)
+        (if (eql (class-of gf) *the-class-standard-gf*)
+            (std-compute-applicable-methods-using-classes gf classes)
+            (compute-applicable-methods-using-classes gf classes))
+      (when (not validp)
+        ;; EQL specialized.
+        (setf applicable-methods (if (eql (class-of gf) *the-class-standard-gf*)
+                                     (std-compute-applicable-methods gf args)
+                                     (compute-applicable-methods gf args))))
+      (let ((emfun (cond (applicable-methods
+                          (std-compute-effective-method-function gf applicable-methods))
+                         (t
+                          (lambda (&rest args)
+                            (apply #'no-applicable-method gf args))))))
+        ;; Cache is only valid for non-eql methods.
+        (when validp
+          (setf (single-dispatch-emf-entry (classes-to-emf-table gf) class) emfun)
+          (pushnew gf (class-dependents class)))
+        (apply emfun args)))))
+
+(defun slow-unspecialized-dispatch-method-lookup (gf args)
+  (let* ((classes (loop
+                     for req in (required-portion gf args)
+                     collect *the-class-t*))
+         (applicable-methods (std-compute-applicable-methods-using-classes gf classes))
+         (emfun (cond (applicable-methods
                         (std-compute-effective-method-function gf applicable-methods))
                        (t
-                        (lambda (&rest args)
-                          (apply #'no-applicable-method gf args))))))
-      (setf (single-dispatch-emf-entry (classes-to-emf-table gf) class) emfun)
-      (pushnew gf (class-dependents class))
-      (apply emfun args))))
+                        (apply #'no-applicable-method gf args)))))
+    (setf (generic-function-discriminating-function gf) emfun)
+    (set-funcallable-instance-function gf emfun)
+    (apply emfun args)))
 
 ;;; compute-applicable-methods-using-classes
 
@@ -1522,11 +1811,51 @@ has only has class specializer."
                                  (method-specializers method))))
                  methods)))
 
+(defun std-compute-effective-method-standard-method-combination (gf applicable-methods)
+  (let (around before primary after)
+    (dolist (method
+              applicable-methods)
+      (cond ((match-qualifier-pattern '(:around) (method-qualifiers method))
+             (push method around))
+            ((match-qualifier-pattern '(:before) (method-qualifiers method))
+             (push method before))
+            ((match-qualifier-pattern 'nil (method-qualifiers method))
+             (push method primary))
+            ((match-qualifier-pattern '(:after) (method-qualifiers method))
+             (push method after))
+            (t
+             (invalid-method-error method "No specifiers matched."))))
+    (when (endp primary)
+      (error "No primary methods in generic function ~S." gf))
+    (setf around (reverse around))
+    (setf before (reverse before))
+    (setf primary (reverse primary))
+    (setf after (reverse after))
+    (flet ((call-methods (methods)
+             (mapcar #'(lambda (method)
+                         `(call-method ,method))
+                     methods)))
+      (let ((form (if (or before
+                          after
+                          (rest primary))
+                      `(multiple-value-prog1
+                           (progn ,@(call-methods before)
+                                  (call-method ,(first primary) ,(rest primary)))
+                         ,@(call-methods (reverse after)))
+                      `(call-method ,(first primary)))))
+        (if around
+            `(call-method ,(first around)
+                          (,@(rest around)
+                           (make-method ,form)))
+            form)))))
+
 (defun std-compute-effective-method (gf mc methods)
-  (apply (method-combination-combiner (method-combination-object-method-combination mc))
-         gf
-         methods
-         (method-combination-object-arguments mc)))
+  (if mc
+      (apply (method-combination-combiner (method-combination-object-method-combination mc))
+             gf
+             methods
+             (method-combination-object-arguments mc))
+      (std-compute-effective-method-standard-method-combination gf methods)))
 
 (defun std-compute-effective-method-function (gf methods)
   (let ((mc (generic-function-method-combination gf)))
@@ -1605,16 +1934,33 @@ has only has class specializer."
   (declare (ignore initargs))
   (fc-std-allocate-instance class))
 
-(defun std-compute-initargs (class initargs)
+(defgeneric compute-default-initargs (class))
+(defmethod compute-default-initargs ((class std-class))
+  (std-compute-default-initargs class))
+
+(defun std-compute-default-initargs (class)
   (let ((default-initargs '()))
     (dolist (c (class-precedence-list class))
       (loop
          for (initarg form fn) in (class-direct-default-initargs c)
-         do (when (and (not (member initarg initargs))
-                       (not (member initarg default-initargs)))
-              (push initarg default-initargs)
-              (push (funcall fn) default-initargs))))
-    (append initargs (nreverse default-initargs))))
+         do (when (not (member initarg default-initargs :key #'first))
+              (push (list initarg form fn) default-initargs))))
+    (nreverse default-initargs)))
+
+(defun std-compute-initargs (class initargs)
+  (let ((default-initargs
+         (loop
+            for (initarg form fn) in (class-default-initargs class)
+            when (loop
+                    for (key value) on initargs by #'cddr
+                    when (eql key initarg)
+                    do (return nil)
+                    finally (return t))
+            collect initarg
+            and collect (funcall fn))))
+    (if default-initargs
+        (append initargs default-initargs)
+        initargs)))
 
 (defgeneric make-instance (class &rest initargs &key &allow-other-keys))
 (defmethod make-instance ((class std-class) &rest initargs)
@@ -1624,6 +1970,13 @@ has only has class specializer."
     instance))
 (defmethod make-instance ((class symbol) &rest initargs)
   (apply #'make-instance (find-class class) initargs))
+
+(define-compiler-macro make-instance (&whole whole class &rest initargs &key &allow-other-keys)
+  (cond ((typep class '(cons (eql quote) (cons symbol null)))
+         ;; Avoid the dispatch on symbol and the class lookup.
+         `(make-instance (find-class ,class) ,@initargs))
+        (t
+         whole)))
 
 (defgeneric initialize-instance (instance &key &allow-other-keys))
 (defmethod initialize-instance ((instance standard-object) &rest initargs)
@@ -1859,12 +2212,17 @@ has only has class specializer."
 (defgeneric no-applicable-method (generic-function &rest function-arguments))
 
 (defmethod no-applicable-method ((generic-function t) &rest function-arguments)
-  (error "No applicable methods to generic function ~S (~S) when called with ~S."
-         generic-function (generic-function-name generic-function) function-arguments))
+  (restart-case
+      (error "No applicable methods to generic function ~S (~S) when called with ~S."
+             generic-function (generic-function-name generic-function) function-arguments)
+    (continue ()
+      :report "Retry calling the generic function."
+      (apply generic-function function-arguments))))
 
 ;;; Built-in-class.
 
 (defmethod initialize-instance :after ((class built-in-class) &rest args)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (apply #'std-after-initialization-for-classes class args)
   (when (not (slot-boundp class 'prototype))
     (setf (slot-value class 'prototype) (std-allocate-instance class))))
@@ -1878,6 +2236,7 @@ has only has class specializer."
   ((structure-definition :initarg :definition)))
 
 (defmethod allocate-instance ((class structure-class) &rest initargs)
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (declare (ignore initargs))
   (let* ((def (slot-value class 'structure-definition))
          (slots (sys.int::structure-slots def))
@@ -1899,6 +2258,7 @@ has only has class specializer."
   (error "Cannot reinitialize structure classes."))
 
 (defmethod slot-value-using-class ((class structure-class) instance (slot standard-effective-slot-definition))
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (let ((def (slot-value class 'structure-definition))
         (slot-name (slot-definition-name slot)))
     (when (not (eql (sys.int::%object-ref-t instance 0) def))
@@ -1909,6 +2269,7 @@ has only has class specializer."
         (return (funcall (sys.int::structure-slot-accessor slot) instance))))))
 
 (defmethod (setf slot-value-using-class) (new-value (class structure-class) instance (slot standard-effective-slot-definition))
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (let ((def (slot-value class 'structure-definition))
         (slot-name (slot-definition-name slot)))
     (when (not (eql (sys.int::%object-ref-t instance 0) def))
@@ -1920,7 +2281,7 @@ has only has class specializer."
       (when (eql (sys.int::structure-slot-name slot) slot-name)
         (when (sys.int::structure-slot-read-only slot)
           (error "The slot ~S in class ~S is read-only." slot-name (class-name class)))
-        (return (funcall `(setf ,(sys.int::structure-slot-accessor slot)) new-value instance))))))
+        (return (funcall (fdefinition `(setf ,(sys.int::structure-slot-accessor slot))) new-value instance))))))
 
 (defmethod slot-boundp-using-class ((class structure-class) instance (slot standard-effective-slot-definition))
   t)
@@ -1944,6 +2305,9 @@ has only has class specializer."
 
 (defmethod compute-effective-slot-definition ((class structure-class) name direct-slots)
   (std-compute-effective-slot-definition class name direct-slots))
+
+(defmethod compute-default-initargs ((class structure-class))
+  (std-compute-default-initargs class))
 
 (defclass structure-object (t)
   ()
@@ -2115,7 +2479,19 @@ has only has class specializer."
   (when (not (class-finalized-p class))
     (error "Class ~S has not been finalized." class)))
 
+(defmethod class-prototype ((class built-in-class))
+  (when (not (slot-boundp class 'prototype))
+    ;; This isn't really right...
+    (setf (slot-value class 'prototype)
+          (allocate-std-instance
+           class
+           (allocate-slot-storage (length (class-slot-storage-layout class))
+                                  *secret-unbound-value*)
+           (class-slot-storage-layout class))))
+  (slot-value class 'prototype))
+
 (defmethod class-prototype ((class clos-class))
+  (declare (notinline slot-value (setf slot-value))) ; Bootstrap hack
   (when (not (slot-boundp class 'prototype))
     (setf (slot-value class 'prototype) (allocate-instance class)))
   (slot-value class 'prototype))
@@ -2131,3 +2507,10 @@ has only has class specializer."
 (defgeneric slot-missing (class object slot-name operation &optional new-value))
 (defmethod slot-missing ((class t) object slot-name operation &optional new-value)
   (error "Slot ~S missing from class ~S when performing ~S." slot-name class operation))
+
+(defgeneric function-keywords (method))
+
+(defmethod function-keywords ((method standard-method))
+  (let ((lambda-list-info (analyze-lambda-list (method-lambda-list method))))
+    (values (getf lambda-list-info :keywords)
+            (getf lambda-list-info :allow-other-keys))))

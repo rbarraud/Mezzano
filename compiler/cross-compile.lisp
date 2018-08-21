@@ -443,7 +443,8 @@
              (keywordp symbol)
              (cl:constantp symbol))
          :constant)
-        (t (gethash symbol *system-symbol-declarations*))))
+        (t
+         (values (gethash symbol *system-symbol-declarations*)))))
 
 (defvar *output-fasl*)
 (defvar *output-map*)
@@ -457,7 +458,7 @@
 (defun x-compile-top-level-lms-body (forms env mode)
   "Common code for handling the body of LOCALLY, MACROLET and SYMBOL-MACROLET forms at the top-level."
   (multiple-value-bind (body declares)
-      (parse-declares forms)
+      (sys.int::parse-declares forms)
     (x-compile-top-level-implicit-progn
      body (extend-environment env :declarations declares) mode)))
 
@@ -567,32 +568,25 @@
   (alexandria:ensure-gethash name *fref-table*
                              (make-cross-fref name)))
 
+(defun sys.int::function-reference (name)
+  (resolve-fref name))
+
 (defun sys.int::assemble-lap (code &optional name debug-info wired architecture)
   (declare (ignore wired))
   (multiple-value-bind (mc constants fixups symbols gc-data)
       (let ((sys.lap:*function-reference-resolver* #'resolve-fref))
         (declare (special sys.lap:*function-reference-resolver*)) ; blech.
-        (ecase architecture
-          (:x86-64
-           (sys.lap-x86:assemble code
-             :base-address 16
-             :initial-symbols '((nil . :fixup)
-                                (t . :fixup)
-                                (:unbound-value . :fixup)
-                                (:undefined-function . :fixup)
-                                (:closure-trampoline . :fixup)
-                                (:funcallable-instance-trampoline . :fixup))
-             :info (list name debug-info)))
-          (:arm64
-           (mezzano.lap.arm64:assemble code
-             :base-address 16
-             :initial-symbols '((nil . :fixup)
-                                (t . :fixup)
-                                (:unbound-value . :fixup)
-                                (:undefined-function . :fixup)
-                                (:closure-trampoline . :fixup)
-                                (:funcallable-instance-trampoline . :fixup))
-             :info (list name debug-info)))))
+        (sys.lap:perform-assembly-using-target
+         (canonicalize-target architecture)
+         code
+         :base-address 16
+         :initial-symbols '((nil . :fixup)
+                            (t . :fixup)
+                            (:unbound-value . :fixup)
+                            (:undefined-function . :fixup)
+                            (:closure-trampoline . :fixup)
+                            (:funcallable-instance-trampoline . :fixup))
+         :info (list name debug-info)))
     (declare (ignore symbols))
     (make-cross-function :mc mc
                          :constants constants
@@ -741,12 +735,12 @@
   (save-object (structure-slot-read-only object) omap stream)
   (write-byte sys.int::+llf-structure-slot-definition+ stream))
 
-(defun %single-float-as-integer (value)
+(defun sys.int::%single-float-as-integer (value)
   (check-type value single-float)
   #+sbcl (ldb (byte 32 0) (sb-kernel:single-float-bits value))
   #-(or sbcl) (error "Not implemented on this platform!"))
 
-(defun %double-float-as-integer (value)
+(defun sys.int::%double-float-as-integer (value)
   (check-type value double-float)
   #+sbcl (logior (ash (ldb (byte 32 0) (sb-kernel:double-float-high-bits value)) 32)
                  (ldb (byte 32 0) (sb-kernel:double-float-low-bits value)))
@@ -756,10 +750,10 @@
   (etypecase object
     (single-float
      (write-byte sys.int::+llf-single-float+ stream)
-     (save-integer (%single-float-as-integer object) stream))
+     (save-integer (sys.int::%single-float-as-integer object) stream))
     (double-float
      (write-byte sys.int::+llf-double-float+ stream)
-     (save-integer (%double-float-as-integer object) stream))))
+     (save-integer (sys.int::%double-float-as-integer object) stream))))
 
 (defmethod save-one-object ((object ratio) omap stream)
   (write-byte sys.int::+llf-ratio+ stream)
@@ -799,12 +793,12 @@
      (save-integer (denominator (imagpart object)) stream))
     (single-float
      (write-byte sys.int::+llf-complex-single-float+ stream)
-     (save-integer (%single-float-as-integer (realpart object)) stream)
-     (save-integer (%single-float-as-integer (imagpart object)) stream))
+     (save-integer (sys.int::%single-float-as-integer (realpart object)) stream)
+     (save-integer (sys.int::%single-float-as-integer (imagpart object)) stream))
     (double-float
      (write-byte sys.int::+llf-complex-double-float+ stream)
-     (save-integer (%double-float-as-integer (realpart object)) stream)
-     (save-integer (%double-float-as-integer (imagpart object)) stream))))
+     (save-integer (sys.int::%double-float-as-integer (realpart object)) stream)
+     (save-integer (sys.int::%double-float-as-integer (imagpart object)) stream))))
 
 (defun save-object (object omap stream)
   (let ((info (alexandria:ensure-gethash object omap (list (hash-table-count omap) 0 nil))))
@@ -832,7 +826,7 @@
                     (declare (special ,ltv-sym))
                   (setq ,ltv-sym ,form))
                nil)
-    `(symbol-value ',ltv-sym)))
+    `(sys.int::symbol-global-value ',ltv-sym)))
 
 (defvar *failed-fastload-by-symbol* (make-hash-table))
 
@@ -887,7 +881,8 @@
                                        (princ-to-string *compile-file-pathname*))
                                      sys.int::*top-level-form-number*
                                      lambda-list
-                                     docstring)
+                                     docstring
+                                     nil)
                                nil
                                *target-architecture*))
           env))))
@@ -1040,9 +1035,10 @@
            (*package* (find-package "CL-USER"))
            (*compile-print* *compile-print*)
            (*compile-verbose* *compile-verbose*)
-           (*compile-file-pathname* (pathname (merge-pathnames path)))
-           (*compile-file-truename* (truename *compile-file-pathname*))
-           (*gensym-counter* 0))
+           (*compile-file-pathname* nil)
+           (*compile-file-truename* nil)
+           (*gensym-counter* 0)
+           (*use-new-compiler* nil))
       (dolist (b builtins)
         (let ((form `(sys.int::%defun ',(first b) ,(second b))))
           (let ((*print-length* 3)
@@ -1085,3 +1081,14 @@
   ;; It's not currently needed by any of the cross-compiled files.
   (declare (ignore env))
   (eval lambda))
+
+(defparameter *cross-logical-base* "SYS:SOURCE")
+
+(defun namestring (pathname)
+  ;; Convert back to a relative path, then emit as a logical pathname.
+  (let ((p (enough-namestring pathname)))
+    (format nil "~:@(~A;~{~A;~}~A.~A.NEWEST~)"
+            *cross-logical-base*
+            (rest (pathname-directory p))
+            (pathname-name p)
+            (pathname-type p))))

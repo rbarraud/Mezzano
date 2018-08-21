@@ -141,14 +141,6 @@
                  (char-downcase c)
                  (char-upcase c)))))
 
-(defun follow-stream-designator (stream default)
-  (cond ((null stream) default)
-        ((eql stream 't) *terminal-io*)
-        ((streamp stream) stream)
-        (t (error 'type-error
-                  :expected-type '(or stream null (eql t))
-                  :datum stream))))
-
 (defun whitespace[2]p (char &optional (readtable *readtable*))
   "Test if CHAR is a whitespace[2] character under READTABLE."
   (eql (readtable-syntax-type char readtable) :whitespace))
@@ -288,10 +280,10 @@
       ;; Attempt to parse a number.
       (t (or (read-integer token)
              (read-float token)
-             (read-ratio token)
+             (read-ratio token stream)
              (intern token))))))
 
-(defun read-ratio (string)
+(defun read-ratio (string stream)
   ;; ratio = sign? digits+ slash digits+
   (let ((numerator nil)
         (denominator nil)
@@ -341,13 +333,17 @@
            (return-from read-ratio))
          (setf denominator (+ (* denominator *read-base*)
                               weight))))
+    (when (zerop denominator)
+      (error 'simple-reader-error :stream stream
+             :format-control "Invalid ratio, dividing by zero: ~A"
+             :format-arguments (list string)))
     (/ numerator denominator)))
 
 (defvar *exponent-markers* "DdEeFfLlSs")
 (defvar *decimal-digits* "0123456789")
 
 (defun read-float (string)
-  ;; float    = sign? decimal-digit* decimal-point decimal-digit+
+  ;; float    = sign? decimal-digit* decimal-point decimal-digit+ [exponent]
   ;;          = sign? decimal-digit+ [decimal-point decimal-digit*] exponent
   ;; exponent = exponent-marker [sign] decimal-digit+
   ;; exponent-marker = d | D | e | E | f | F | l | L | s | S
@@ -390,9 +386,10 @@
         ;; If there was an integer part, then the next character
         ;; must be either a decimal-digit or an exponent marker.
         ;; If there was no integer part, it must be a decimal-digit.
-        (when (and (not (or (not saw-integer-digits)
-                            (find (peek) *exponent-markers*)))
-                   (not (find (peek) *decimal-digits*)))
+        (when (not (if saw-integer-digits
+                       (or (find (peek) *exponent-markers*)
+                           (find (peek) *decimal-digits*))
+                       (find (peek) *decimal-digits*)))
           (return-from read-float))
         ;; Accumulate decimal digits.
         (let ((first-decimal position))
@@ -413,9 +410,10 @@
                (setf exponent-sign -1))
           (#\+ (consume)))
         ;; Must be at least one digit in the exponent
-        ;; and one digit in the integer part
+        ;; and either one digit in the integer part or a decimal point.
         (when (or (not (find (peek) *decimal-digits*))
-                  (not saw-integer-digits))
+                  (not (or saw-integer-digits
+                           saw-decimal-point)))
           (return-from read-float))
         ;; Read exponent part.
         (loop (when (not (find (peek) *decimal-digits*))
@@ -564,19 +562,29 @@
         (vector-push-extend (read-char stream t nil t) string)
         (vector-push-extend x string))))
 
+(defvar *backquote-depth* 0)
+
 (defun read-backquote (stream first)
   (declare (ignore first))
-  (list 'backquote (read stream t nil t)))
+  (list 'backquote
+        (let ((*backquote-depth* (1+ *backquote-depth*)))
+          (read stream t nil t))))
 
 (defun read-comma (stream first)
   (declare (ignore first))
-  (case (peek-char nil stream t)
-    (#\@ (read-char stream t nil t)
-         (list 'bq-comma-atsign (read stream t nil t)))
-    (#\. (read-char stream t nil t)
-         (list 'bq-comma-dot (read stream t nil t)))
-    (otherwise
-     (list 'bq-comma (read stream t nil t)))))
+  (when (zerop *backquote-depth*)
+    (error 'simple-reader-error
+           :stream stream
+           :format-control "Comma not inside a backquote"
+           :format-arguments '()))
+  (let ((*backquote-depth* (1- *backquote-depth*)))
+    (case (peek-char nil stream t)
+      (#\@ (read-char stream t nil t)
+           (list 'bq-comma-atsign (read stream t nil t)))
+      (#\. (read-char stream t nil t)
+           (list 'bq-comma-dot (read stream t nil t)))
+      (otherwise
+       (list 'bq-comma (read stream t nil t))))))
 
 (defun read-dispatch-char (stream first)
   "Dispatch to a dispatching macro character."
@@ -611,11 +619,17 @@
             (case ch
               (#\0 (vector-push-extend 0 bits))
               (#\1 (vector-push-extend 1 bits))
-              (t (error "Invalid character ~S in #*." ch)))))
+              (t (error 'simple-reader-error :stream stream
+                        :format-control "Invalid character ~S in #*."
+                        :format-arguments (list ch))))))
     (when (and p (not (zerop p)) (zerop (length bits)))
-      (error "Need at least one bit for #* with an explicit length."))
+      (error 'simple-reader-error :stream stream
+             :format-control "Need at least one bit for #* with an explicit length."
+             :format-arguments '()))
     (when (and p (> (length bits) p))
-      (error "Too many bits."))
+      (error 'simple-reader-error :stream stream
+             :format-control "Too many bits."
+             :format-arguments '()))
     (let ((final-array (make-array (or p (length bits))
                                    :element-type 'bit)))
       (unless (zerop (length final-array))
@@ -684,13 +698,14 @@
 
 (defun read-#-dot (stream ch p)
   (ignore-#-argument ch p)
-  (cond (*read-suppress*
-         (read stream t nil t))
-        (*read-eval*
-         (eval (read stream t nil t)))
-        (t (error 'simple-reader-error :stream stream
-                  :format-control "Cannot #. when *READ-EVAL* is false."
-                  :format-arguments '()))))
+  (let ((*backquote-depth* 0))
+    (cond (*read-suppress*
+           (read stream t nil t))
+          (*read-eval*
+           (eval (read stream t nil t)))
+          (t (error 'simple-reader-error :stream stream
+                    :format-control "Cannot #. when *READ-EVAL* is false."
+                    :format-arguments '())))))
 
 (defun read-#-radix (stream ch p)
   "Read a number in the specified radix."
@@ -780,6 +795,10 @@
 
 (defun read-#-features (stream suppress-if-false)
   "Common function to implement #+ and #-."
+  (when *read-suppress*
+    ;; Read & ignore the feature.
+    (read stream t nil t)
+    (return-from read-#-features (values)))
   (let* ((test (let ((*package* (find-package "KEYWORD")))
                  (read stream t nil t)))
          (*read-suppress* (or *read-suppress*
@@ -865,7 +884,7 @@
 
 (defun read (&optional input-stream (eof-error-p t) eof-value recursive-p)
   "READ parses the printed representation of an object from STREAM and builds such an object."
-  (let ((stream (follow-stream-designator input-stream *standard-input*)))
+  (let ((stream (frob-input-stream input-stream)))
     (with-stream-editor (stream recursive-p)
       (let ((result (read-common stream
                                  eof-error-p
@@ -879,19 +898,10 @@
         result))))
 
 (defun read-preserving-whitespace (&optional input-stream (eof-error-p t) eof-value recursive-p)
-  (read-common (follow-stream-designator input-stream *standard-input*)
+  (read-common (frob-input-stream input-stream)
                eof-error-p
                eof-value
                recursive-p))
-
-(defun read-from-string (string &optional (eof-error-p t) eof-value &key (start 0) end preserve-whitespace)
-  (let (index)
-    (values
-     (with-input-from-string (stream string :start start :end end :index index)
-       (if preserve-whitespace
-           (read-preserving-whitespace stream eof-error-p eof-value)
-           (read stream eof-error-p eof-value)))
-     index)))
 
 (defmacro with-standard-io-syntax (&body body)
   `(%with-standard-io-syntax (lambda () (progn ,@body))))
@@ -975,7 +985,10 @@
   (set-dispatch-macro-character #\# #\- 'read-#-minus readtable)
   (set-dispatch-macro-character #\# #\| 'read-#-vertical-bar readtable)
   (set-dispatch-macro-character #\# #\< 'read-#-invalid readtable)
+  (set-dispatch-macro-character #\# #\Backspace 'read-#-invalid readtable)
+  (set-dispatch-macro-character #\# #\Linefeed 'read-#-invalid readtable)
   (set-dispatch-macro-character #\# #\Newline 'read-#-invalid readtable)
+  (set-dispatch-macro-character #\# #\Return 'read-#-invalid readtable)
   (set-dispatch-macro-character #\# #\Space 'read-#-invalid readtable)
   (set-dispatch-macro-character #\# #\Tab 'read-#-invalid readtable)
   (set-dispatch-macro-character #\# #\Page 'read-#-invalid readtable)

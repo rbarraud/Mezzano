@@ -14,20 +14,52 @@
 ;;; Primordial class objects installed in the class table during boot will
 ;;; be converted in-place to real classes after boot.
 
-(sys.int::defglobal *class-table* (make-hash-table :test #'eq))
+(sys.int::defglobal *class-reference-table* (make-hash-table :test #'eq))
 
-(defun find-class (symbol &optional (errorp t) environment)
-  (let ((class (gethash symbol *class-table* nil)))
+(defstruct class-reference
+  name
+  class)
+
+(defun class-reference (symbol)
+  (or (gethash symbol *class-reference-table*)
+      (setf (gethash symbol *class-reference-table*)
+            (make-class-reference :name symbol))))
+
+(define-compiler-macro find-class (&whole whole symbol &optional (errorp t) environment)
+  (if (and (null environment)
+           (consp symbol)
+           (eql (first symbol) 'quote)
+           (consp (rest symbol))
+           (symbolp (second symbol))
+           (null (rest (rest symbol))))
+      `(find-class-in-reference
+        (load-time-value (mezzano.clos:class-reference ',(second symbol)))
+        ,errorp)
+      whole))
+
+(defun find-class-in-reference (reference &optional (errorp t))
+  (let ((class (class-reference-class reference))
+        (symbol (class-reference-name reference)))
     (when (not class)
-      (let ((struct (get symbol 'sys.int::structure-type)))
+      (let ((struct (sys.int::get-structure-type symbol nil)))
         (when struct
           (setf class (class-of-structure-definition struct)))))
     (if (and (null class) errorp)
         (error "No class named ~S." symbol)
         class)))
 
+(defun find-class (symbol &optional (errorp t) environment)
+  (declare (ignore environment))
+  (find-class-in-reference (class-reference symbol) errorp))
+
 (defun (setf find-class) (new-value symbol &optional (errorp t) environment)
-  (setf (gethash symbol *class-table*) new-value))
+  (declare (ignore errorp environment))
+  (let ((reference (class-reference symbol)))
+    (cond (new-value
+           (setf (get symbol 'sys.int::maybe-class) t))
+          (t
+           (remprop symbol 'sys.int::maybe-class)))
+    (setf (class-reference-class reference) new-value)))
 
 (sys.int::defglobal *next-class-hash-value* 1)
 
@@ -239,7 +271,8 @@
    (dependents :initform '())
    (hash :initform (next-class-hash-value))
    (finalized-p :initform nil)
-   (prototype))
+   (prototype)
+   (default-initargs)) ; :accessor class-default-initargs
   (:default-initargs :name nil))
 
 (defclass built-in-class (clos-class) ())
@@ -249,13 +282,11 @@
 (defclass funcallable-standard-class (std-class) ())
 
 (defclass function (t) () (:metaclass built-in-class))
+(defclass mezzano.delimited-continuations:delimited-continuation (function) () (:metaclass built-in-class))
 (defclass symbol (t) () (:metaclass built-in-class))
 (defclass character (t) () (:metaclass built-in-class))
-;; FIXME: This should be a built-in class, but this is tricky to make work
-;; with gray streams.
-;; Specifically, FUNDAMENTAL-STREAM needs to inherit from STREAM, but
-;; this will fail because BUILT-IN-CLASSes are not compatible with STANDARD-CLASSes.
-;; One solution would be to just define early FUNDAMENTAL-STREAM here...
+;; Streams are ordinary objects with no special representation,
+;; they don't need to be BUILT-IN-CLASSes.
 (defclass stream (t) ())
 (defclass mezzano.supervisor:thread (t) () (:metaclass built-in-class))
 (defclass sys.int::function-reference (t) () (:metaclass built-in-class))
@@ -284,6 +315,8 @@
 (defclass float (real) () (:metaclass built-in-class))
 (defclass complex (number) () (:metaclass built-in-class))
 
+(defclass mezzano.simd:mmx-vector (t) () (:metaclass built-in-class))
+(defclass mezzano.simd:sse-vector (t) () (:metaclass built-in-class))
 
 ;;; Done defining classes.
 ;;; Don't define any new classes in this file after this point!
@@ -452,6 +485,15 @@
              (setf (primordial-slot-value slot 'location) nil))))
     effective-slots))
 
+(defun primordial-compute-default-initargs (class)
+  (let ((default-initargs '()))
+    (dolist (c (primordial-slot-value class 'class-precedence-list))
+      (loop
+         for (initarg form fn) in (primordial-slot-value class 'direct-default-initargs)
+         do (when (not (member initarg default-initargs :key #'first))
+              (push (list initarg form fn) default-initargs))))
+    (nreverse default-initargs)))
+
 (defun finalize-primordial-class (class)
   (when (not (primordial-slot-value class 'finalized-p))
     (dolist (super (primordial-slot-value class 'direct-superclasses))
@@ -464,6 +506,8 @@
     (setf (primordial-slot-value class 'effective-slots)
           (primordial-compute-slots class))
     ;;(format t "  Slots: ~:S~%" (mapcar (lambda (x) (primordial-slot-value x 'name)) (primordial-slot-value class 'effective-slots)))
+    (setf (primordial-slot-value class 'default-initargs)
+          (primordial-compute-default-initargs class))
     ;; Check that the early layout and computed layout match up.
     (let ((instance-slots (remove-if-not (lambda (x) (eql (primordial-slot-value x 'allocation) :instance))
                                          (primordial-slot-value class 'effective-slots)))
@@ -525,6 +569,7 @@
 ;; Known important classes.
 (setf *the-class-standard-class* (find-class 'standard-class)
       *the-class-funcallable-standard-class* (find-class 'funcallable-standard-class)
+      *the-class-built-in-class* (find-class 'built-in-class)
       *the-class-standard-direct-slot-definition* (find-class 'standard-direct-slot-definition)
       *the-class-standard-effective-slot-definition* (find-class 'standard-effective-slot-definition)
       *the-class-standard-gf* (find-class 'standard-generic-function)
@@ -533,12 +578,21 @@
 
 ;; Positions of various slots in standard-class and funcallable-standard-class.
 (let ((s-c-layout (primordial-slot-value (find-class 'standard-class) 'slot-storage-layout)))
-  ;; Verify that standard-class and funcallable-standard-class have the same layout.
+  ;; Verify that standard-class, funcallable-standard-class, and built-in-class have the same layout.
   (when (not (equalp s-c-layout
                      (primordial-slot-value (find-class 'funcallable-standard-class) 'slot-storage-layout)))
     (error (format nil "STANARD-CLASS and FUNCALLABLE-STANDARD-CLASS have different layouts.~%S-C: ~S~%F-S-C: ~S~%"
                    s-c-layout
                    (primordial-slot-value (find-class 'funcallable-standard-class) 'slot-storage-layout))))
+  (when (not (equalp s-c-layout
+                     (primordial-slot-value (find-class 'built-in-class) 'slot-storage-layout)))
+    (error (format nil "STANARD-CLASS and BUILT-IN-CLASS have different layouts.~%S-C: ~S~%F-S-C: ~S~%"
+                   s-c-layout
+                   (primordial-slot-value (find-class 'built-in-class) 'slot-storage-layout))))
   (setf *standard-class-effective-slots-position* (position 'effective-slots s-c-layout)
         *standard-class-slot-storage-layout-position* (position 'slot-storage-layout s-c-layout)
-        *standard-class-hash-position* (position 'hash s-c-layout)))
+        *standard-class-hash-position* (position 'hash s-c-layout)
+        *standard-class-finalized-p-position* (position 'finalized-p s-c-layout)
+        *standard-class-precedence-list-position* (position 'class-precedence-list s-c-layout)
+        *standard-class-direct-default-initargs-position* (position 'direct-default-initargs s-c-layout)
+        *standard-class-default-initargs-position* (position 'default-initargs s-c-layout)))

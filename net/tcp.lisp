@@ -391,6 +391,8 @@
 (define-condition connection-timed-out (connection-error)
   ())
 
+(defparameter *tcp-connect-timeout* 10)
+
 (defun tcp-connect (ip port)
   (multiple-value-bind (host interface)
       (mezzano.network.ip:ipv4-route ip)
@@ -410,7 +412,7 @@
         (push connection *tcp-connections*))
       (tcp4-send-packet connection seq 0 nil :ack-p nil :syn-p t)
       ;; FIXME: Better timeout mechanism.
-      (let ((timeout (+ (get-universal-time) 10)))
+      (let ((timeout (+ (get-universal-time) *tcp-connect-timeout*)))
         (loop
            (when (not (eql (tcp-connection-state connection) :syn-sent))
              (when (eql (tcp-connection-state connection) :connection-aborted)
@@ -451,13 +453,16 @@
                                    (subseq data start end))
                                :psh-p t))))))))
 
-(defclass tcp-stream (sys.gray:fundamental-character-input-stream
-                      sys.gray:fundamental-character-output-stream
-                      sys.gray:fundamental-binary-input-stream
-                      sys.gray:fundamental-binary-output-stream
-                      sys.gray:unread-char-mixin)
+(defclass tcp-octet-stream (sys.gray:fundamental-binary-input-stream
+                            sys.gray:fundamental-binary-output-stream)
   ((connection :initarg :connection :reader tcp-stream-connection)
    (current-packet :initform nil :accessor tcp-stream-packet)))
+
+(defclass tcp-stream (sys.gray:fundamental-character-input-stream
+                      sys.gray:fundamental-character-output-stream
+                      tcp-octet-stream
+                      sys.gray:unread-char-mixin)
+  ())
 
 (defun refill-tcp-stream-buffer (stream)
   (let ((connection (tcp-stream-connection stream)))
@@ -477,7 +482,7 @@
     (refill-tcp-stream-buffer stream)
     (not (null (tcp-stream-packet stream)))))
 
-(defmethod sys.gray:stream-read-byte ((stream tcp-stream))
+(defmethod sys.gray:stream-read-byte ((stream tcp-octet-stream))
   (with-tcp-connection-locked (tcp-stream-connection stream)
     (when (not (refill-tcp-packet-buffer stream))
       (return-from sys.gray:stream-read-byte :eof))
@@ -563,10 +568,17 @@
           #\REPLACEMENT_CHARACTER
           (code-char code-point)))))
 
-(defmethod sys.gray:stream-write-byte ((stream tcp-stream) byte)
+(defmethod sys.gray:stream-write-byte ((stream tcp-octet-stream) byte)
   (let ((ary (make-array 1 :element-type '(unsigned-byte 8)
                          :initial-element byte)))
     (tcp-send (tcp-stream-connection stream) ary)))
+
+(defmethod sys.gray:stream-write-sequence ((stream tcp-octet-stream) sequence &optional (start 0) end)
+  (unless end (setf end (length sequence)))
+  (cond ((not (and (zerop start)
+                   (eql end (length sequence))))
+         (setf sequence (subseq sequence start end))))
+  (tcp-send (tcp-stream-connection stream) sequence))
 
 (defmethod sys.gray:stream-write-sequence ((stream tcp-stream) sequence &optional (start 0) end)
   (unless end (setf end (length sequence)))
@@ -581,8 +593,25 @@
   (sys.gray:stream-write-sequence stream (string character))
   character)
 
-(defmethod close ((stream tcp-stream) &key abort)
+(defmethod close ((stream tcp-octet-stream) &key abort)
+  (declare (ignore abort))
   (close-tcp-connection (tcp-stream-connection stream)))
 
-(defun tcp-stream-connect (address port)
-  (make-instance 'tcp-stream :connection (tcp-connect (sys.net::resolve-address address) port)))
+(defmethod open-stream-p ((stream tcp-octet-stream))
+  (not (tcp-connection-closed-p stream)))
+
+(defmethod stream-element-type ((stream tcp-octet-stream))
+  '(unsigned-byte 8))
+
+(defun tcp-stream-connect (address port &key element-type)
+  (cond ((or (not element-type)
+             (and (subtypep element-type 'character)
+                  (subtypep 'character element-type)))
+         (make-instance 'tcp-stream
+                        :connection (tcp-connect (sys.net::resolve-address address) port)))
+        ((and (subtypep element-type '(unsigned-byte 8))
+              (subtypep '(unsigned-byte 8) element-type))
+         (make-instance 'tcp-octet-stream
+                        :connection (tcp-connect (sys.net::resolve-address address) port)))
+        (t
+         (error "Unsupported element type ~S" element-type))))

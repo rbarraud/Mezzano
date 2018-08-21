@@ -249,17 +249,20 @@
   (setf (car (nthcdr n list)) value))
 
 (defun append (&rest lists)
+  (declare (dynamic-extent lists))
   (do* ((head (cons nil nil))
         (tail head)
         (i lists (cdr i)))
        ((null (cdr i))
         (setf (cdr tail) (car i))
         (cdr head))
+    (declare (dynamic-extent head))
     (dolist (elt (car i))
       (setf (cdr tail) (cons elt nil)
             tail (cdr tail)))))
 
 (defun nconc (&rest lists)
+  (declare (dynamic-extent lists))
   (let ((start (do ((x lists (cdr x)))
                    ((or (null x) (car x)) x))))
     (when start
@@ -272,19 +275,27 @@
         (setf (cdr list) (car i))))))
 
 (defun reverse (sequence)
-  (if (listp sequence)
-      (let ((result '()))
-        (dolist (elt sequence result)
-          (setf result (cons elt result))))
-      (nreverse (make-array (length sequence)
-                            :element-type (array-element-type sequence)
-                            :initial-contents sequence))))
+  (etypecase sequence
+    (list
+     (let ((result '()))
+       (dolist (elt sequence result)
+         (setf result (cons elt result)))))
+    (vector
+     (nreverse (make-array (length sequence)
+                           :element-type (array-element-type sequence)
+                           :initial-contents sequence)))))
 
 (defun nreverse (sequence)
-  (if (vectorp sequence)
-      (dotimes (i (truncate (length sequence) 2) sequence)
-             (rotatef (aref sequence i) (aref sequence (- (length sequence) 1 i))))
-      (reverse sequence)))
+  (etypecase sequence
+    (vector
+     (dotimes (i (truncate (length sequence) 2) sequence)
+       (rotatef (aref sequence i) (aref sequence (- (length sequence) 1 i)))))
+    (list
+     (loop
+        with result = '()
+        while (not (endp sequence))
+        do (push (pop sequence) result)
+        finally (return result)))))
 
 ;; The following functional equivalences are true, although good implementations
 ;; will typically use a faster algorithm for achieving the same effect:
@@ -503,8 +514,7 @@
             :key key))
 
 (defun assoc (item alist &key key test test-not)
-  (when (and test test-not)
-    (error "TEST and TEST-NOT specified."))
+  (check-test-test-not test test-not)
   (when test-not
     (setf test (complement test-not)))
   (unless test
@@ -527,8 +537,7 @@
              :key key))
 
 (defun member (item list &key key test test-not)
-  (when (and test test-not)
-    (error "TEST and TEST-NOT specified."))
+  (check-test-test-not test test-not)
   (when test-not
     (setf test (complement test-not)))
   (unless test
@@ -567,11 +576,6 @@
     (when (member (car i) indicator-list)
       (return (values (first i) (second i) i)))))
 
-(define-compiler-macro list* (object &rest objects)
-  (cond
-    ((null objects) object)
-    (t `(cons ,object (list* ,@objects)))))
-
 (defun list* (object &rest objects)
   (declare (dynamic-extent object))
   (if objects
@@ -596,8 +600,7 @@
   (cons (cons key datum) alist))
 
 (defun sublis (alist tree &key key test test-not)
-  (when (and test test-not)
-    (error "TEST and TEST-NOT specified."))
+  (check-test-test-not test test-not)
   (when test-not
     (setf test (complement test-not)))
   (unless test
@@ -672,8 +675,7 @@
             :key key))
 
 (defun subst (new old tree &key key test test-not)
-  (when (and test test-not)
-    (error "TEST and TEST-NOT specified."))
+  (check-test-test-not test test-not)
   (when test-not
     (setf test (complement test-not)))
   (unless test
@@ -710,8 +712,7 @@
              :key key))
 
 (defun rassoc (item alist &key key test test-not)
-  (when (and test test-not)
-    (error "TEST and TEST-NOT specified."))
+  (check-test-test-not test test-not)
   (when test-not
     (setf test (complement test-not)))
   (unless test
@@ -720,44 +721,68 @@
              alist
              :key key))
 
+(declaim (inline set-difference nset-difference
+                 union nunion
+                 intersection nintersection
+                 set-exclusive-or nset-exclusive-or))
+
 (defun set-difference (list-1 list-2 &key key test test-not)
-  (check-type list-1 list)
-  (check-type list-2 list)
   (when (not key)
     (setf key 'identity))
-  (let ((result '()))
-    (dolist (e list-1)
-      (when (not (member (funcall key e) list-2 :key key :test test :test-not test-not))
-        (push e result)))
-    result))
+  (check-type list-1 list)
+  (check-type list-2 list)
+  (check-test-test-not test test-not)
+  (cond (list-2
+         (let ((result '()))
+           (dolist (e list-1)
+             (when (not (member (funcall key e) list-2 :key key :test test :test-not test-not))
+               (push e result)))
+           result))
+        (t
+         list-1)))
+
+(defun nset-difference (list-1 list-2 &key key test test-not)
+  (set-difference list-1 list-2 :key key :test test :test-not test-not))
 
 (defun union (list-1 list-2 &key key test test-not)
-  (check-type list-1 list)
-  (check-type list-2 list)
   (when (not key)
     (setf key 'identity))
-  (let ((result (copy-list list-2)))
-    (dolist (e list-1)
-      (when (not (member (funcall key e) list-2 :key key :test test :test-not test-not))
-        (push e result)))
-    result))
+  (check-type list-1 list)
+  (check-type list-2 list)
+  (check-test-test-not test test-not)
+  (cond ((and list-1 list-2)
+         (let ((result list-2))
+           (dolist (e list-1)
+             (when (not (member (funcall key e) list-2 :key key :test test :test-not test-not))
+               (push e result)))
+           result))
+        (list-1)
+        (list-2)))
+
+(defun nunion (list-1 list-2 &key key test test-not)
+  (union list-1 list-2 :key key :test test :test-not test-not))
 
 (defun intersection (list-1 list-2 &key key test test-not)
-  (check-type list-1 list)
-  (check-type list-2 list)
   (when (not key)
     (setf key 'identity))
+  (check-type list-1 list)
+  (check-type list-2 list)
+  (check-test-test-not test test-not)
   (let ((result '()))
     (dolist (e list-1)
       (when (member (funcall key e) list-2 :key key :test test :test-not test-not)
         (push e result)))
     result))
 
+(defun nintersection (list-1 list-2 &key key test test-not)
+  (intersection list-1 list-2 :key key :test test :test-not test-not))
+
 (defun set-exclusive-or (list-1 list-2 &key key test test-not)
-  (check-type list-1 list)
-  (check-type list-2 list)
   (when (not key)
     (setf key 'identity))
+  (check-type list-1 list)
+  (check-type list-2 list)
+  (check-test-test-not test test-not)
   (let ((result '()))
     (dolist (e list-1)
       (when (not (member (funcall key e) list-2 :key key :test test :test-not test-not))
@@ -767,22 +792,21 @@
         (push e result)))
     result))
 
+(defun nset-exclusive-or (list-1 list-2 &key key test test-not)
+  (set-exclusive-or list-1 list-2 :key key :test test :test-not test-not))
+
 (defun subsetp (list-1 list-2 &key key test test-not)
+  (when (not key)
+    (setf key 'identity))
   (check-type list-1 list)
   (check-type list-2 list)
-  (when (and test test-not)
-    (error ":TEST and :TEST-NOT specified"))
-  (when test-not
-    (setf test (complement test-not)))
-  (setf test (or test #'eql))
-  (setf key (or key #'identity))
+  (check-test-test-not test test-not)
   (every (lambda (e)
-           (member (funcall key e) list-2 :key key :test test))
+           (member (funcall key e) list-2 :key key :test test :test-not test-not))
          list-1))
 
 (defun tree-equal (tree-1 tree-2 &key test test-not)
-  (when (and test test-not)
-    (error "TEST and TEST-NOT specified."))
+  (check-test-test-not test test-not)
   (when test-not
     (setf test (complement test-not)))
   (unless test

@@ -189,9 +189,11 @@
                 ,(create-key-let-body keys values suppliedp)))
            form))))
 
-(defun lower-keyword-arguments (form)
-  (lower-keyword-arguments-1 form)
-  form)
+(defun lower-keyword-arguments (form architecture)
+  (declare (ignore architecture))
+  (with-metering (:lower-keyword-arguments)
+    (lower-keyword-arguments-1 form)
+    form))
 
 (defgeneric lower-keyword-arguments-1 (form))
 

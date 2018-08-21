@@ -28,7 +28,7 @@
     array-complex-double-float ; #b010101
     array-complex-short-float  ; #b010110
     array-complex-long-float   ; #b010111
-    array-xmm-vector           ; #b011000
+    invalid-011000             ; #b011000
     invalid-011001             ; #b011001
     invalid-011010             ; #b011010
     invalid-011011             ; #b011011
@@ -51,11 +51,11 @@
     invalid-101100             ; #b101100
     invalid-101101             ; #b101101
     invalid-101110             ; #b101110
-    invalid-101111             ; #b101111
+    mezzano.simd:mmx-vector    ; #b101111
     symbol                     ; #b110000
     structure-object           ; #b110001
     std-instance               ; #b110010
-    xmm-vector                 ; #b110011
+    mezzano.simd:sse-vector    ; #b110011
     thread                     ; #b110100
     unbound-value              ; #b110101
     function-reference         ; #b110110
@@ -63,7 +63,7 @@
     cons                       ; #b111000
     freelist-entry             ; #b111001
     weak-pointer               ; #b111010
-    invalid-111011             ; #b111011
+    'mezzano.delimited-continuations:delimited-continuation ; #b111011
     function                   ; #b111100
     closure                    ; #b111101
     funcallable-instance       ; #b111110
@@ -168,14 +168,12 @@ Should be kept in sync with data-types.")
                   size)
          (incf address (* size 8))))))
 
-(defun %walk-general-area (fn)
+(defun %walk-general-area-1 (fn base length)
   (let ((finger 0))
     (loop
-       (when (eql finger *general-area-bump*)
+       (when (eql finger length)
          (return))
-       (let* ((address (logior finger
-                               (ash +address-tag-general+ +address-tag-shift+)
-                               *dynamic-mark-bit*))
+       (let* ((address (logior base finger))
               (object (%%assemble-value address +tag-object+))
               (size (object-size object)))
          (funcall fn object address size)
@@ -183,17 +181,41 @@ Should be kept in sync with data-types.")
            (incf size))
          (incf finger (* size 8))))))
 
-(defun %walk-cons-area (fn)
+(defun %walk-general-area (fn)
+  (%walk-general-area-1 fn
+                        (logior (ash +address-tag-general+ +address-tag-shift+)
+                                (dpb sys.int::+address-generation-0+ sys.int::+address-generation+ 0))
+                        *general-area-gen0-bump*)
+  (%walk-general-area-1 fn
+                        (logior (ash +address-tag-general+ +address-tag-shift+)
+                                (dpb sys.int::+address-generation-1+ sys.int::+address-generation+ 0))
+                        *general-area-gen1-bump*)
+  (%walk-general-area-1 fn
+                        (logior (ash +address-tag-general+ +address-tag-shift+) *dynamic-mark-bit*)
+                        *general-area-bump*))
+
+(defun %walk-cons-area-1 (fn base length)
   (let ((finger 0))
     (loop
-       (when (eql finger *cons-area-bump*)
+       (when (eql finger length)
          (return))
-       (let* ((address (logior finger
-                               (ash +address-tag-cons+ +address-tag-shift+)
-                               *dynamic-mark-bit*))
+       (let* ((address (logior base finger))
               (object (%%assemble-value address +tag-cons+)))
          (funcall fn object address 2)
          (incf finger 16)))))
+
+(defun %walk-cons-area (fn)
+  (%walk-cons-area-1 fn
+                     (logior (ash +address-tag-cons+ +address-tag-shift+)
+                             (dpb sys.int::+address-generation-0+ sys.int::+address-generation+ 0))
+                     *cons-area-gen0-bump*)
+  (%walk-cons-area-1 fn
+                     (logior (ash +address-tag-cons+ +address-tag-shift+)
+                             (dpb sys.int::+address-generation-1+ sys.int::+address-generation+ 0))
+                     *cons-area-gen1-bump*)
+  (%walk-cons-area-1 fn
+                     (logior (ash +address-tag-cons+ +address-tag-shift+) *dynamic-mark-bit*)
+                     *cons-area-bump*))
 
 (defun walk-area (area fn)
   "Call FN with the value, address and size of every object in AREA.
@@ -201,8 +223,8 @@ FN will be called with the world stopped, it must not allocate."
   (check-type area (member :pinned :wired :general :cons))
   (mezzano.supervisor:with-world-stopped ()
     (case area
-      (:pinned (%walk-pinned-area (* 2 1024 1024 1024) *pinned-area-bump* fn))
-      (:wired (%walk-pinned-area (* 2 1024 1024) *wired-area-bump* fn))
+      (:pinned (%walk-pinned-area *pinned-area-base* *pinned-area-bump* fn))
+      (:wired (%walk-pinned-area *wired-area-base* *wired-area-bump* fn))
       (:general (%walk-general-area fn))
       (:cons (%walk-cons-area fn)))))
 

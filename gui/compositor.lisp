@@ -13,6 +13,7 @@
 
 (defvar *compositor* nil "Compositor thread.")
 (defvar *compositor-heartbeat* nil "Compositor heartbeat thread. Drives redisplay.")
+(defvar *compositor-debug-enable* nil)
 
 (defvar *event-queue* (mezzano.supervisor:make-fifo 50)
   "Internal FIFO used to submit events to the compositor.")
@@ -43,6 +44,10 @@
                      :cursor :default
                      :grabp nil))
 
+(defclass event ()
+  ((%window :initarg :window :reader window))
+  (:default-initargs :window nil))
+
 (defgeneric width (thing))
 (defgeneric height (thing))
 
@@ -62,6 +67,8 @@
 (defvar *clip-rect-y* 0)
 (defvar *clip-rect-width* 0)
 (defvar *clip-rect-height* 0)
+
+(defparameter *idle-time* 0)
 
 (defun damage-whole-screen ()
   (setf *clip-rect-width* (mezzano.supervisor:framebuffer-width *main-screen*)
@@ -170,7 +177,7 @@
 
 ;;;; Keyboard events, including translation from HID scancode.
 
-(defclass key-event ()
+(defclass key-event (event)
   ((%scancode :initarg :scancode :reader key-scancode)
    (%releasep :initarg :releasep :reader key-releasep)
    (%key :initarg :key :reader key-key)
@@ -224,6 +231,7 @@
       key)))
 
 (defmethod process-event ((event key-event))
+  (setf *idle-time* 0)
   (let* ((scancode (key-scancode event))
          (modifier (assoc scancode *keyboard-modifiers*)))
     (cond ((and modifier (third modifier))
@@ -303,6 +311,7 @@
                  (*active-window*
                   (send-event *active-window*
                               (make-instance 'key-event
+                                             :window *active-window*
                                              :scancode (key-scancode event)
                                              :releasep (key-releasep event)
                                              :key translated
@@ -316,16 +325,14 @@
 
 ;;;; Mouse events
 
-(defclass mouse-event ()
-  ((%window :initarg :window :reader window)
-   (%button-state :initarg :button-state :reader mouse-button-state)
+(defclass mouse-event (event)
+  ((%button-state :initarg :button-state :reader mouse-button-state)
    (%button-change :initarg :button-change :reader mouse-button-change)
    (%x-position :initarg :x-position :reader mouse-x-position)
    (%y-position :initarg :y-position :reader mouse-y-position)
    (%x-motion :initarg :x-motion :reader mouse-x-motion)
    (%y-motion :initarg :y-motion :reader mouse-y-motion))
-  (:default-initargs :window nil
-                     :button-state nil
+  (:default-initargs :button-state nil
                      :button-change 0
                      :x-position nil
                      :y-position nil
@@ -402,6 +409,7 @@ A passive drag sends no drag events to the window.")
                (max 1 (- old-height (- *drag-y-origin* *mouse-y*))))))))
 
 (defmethod process-event ((event mouse-event))
+  (setf *idle-time* 0)
   ;; Update positions and buttons
   (let* ((buttons (or (mouse-button-state event)
                       *mouse-buttons*))
@@ -536,14 +544,14 @@ A passive drag sends no drag events to the window.")
 ;;;; Window creation event.
 ;;;; From clients to the compositor.
 
-(defclass window-create-event ()
-  ((%window :initarg :window :reader window)
-   (%initial-z-order :initarg :initial-z-order :reader initial-z-order)))
+(defclass window-create-event (event)
+  ((%initial-z-order :initarg :initial-z-order :reader initial-z-order)))
 
 (defmethod process-event ((event window-create-event))
   (let ((win (window event)))
-    (format t "Registered new ~Dx~D window ~S, attached to FIFO ~S.~%"
-            (width win) (height win) win (fifo win))
+    (when *compositor-debug-enable*
+      (format t "Registered new ~Dx~D window ~S.~%"
+              (width win) (height win) win))
     (setf (window-x win) 0
           (window-y win) 0)
     (case (layer win)
@@ -604,12 +612,13 @@ A passive drag sends no drag events to the window.")
 
 ;;;; Window close event.
 
-(defclass window-close-event ()
-  ((%window :initarg :window :reader window)))
+(defclass window-close-event (event)
+  ())
 
 (defmethod process-event ((event window-close-event))
   (let ((win (window event)))
-    (format t "Closing window ~S. Goodbye!~%" win)
+    (when *compositor-debug-enable*
+      (format t "Closing window ~S. Goodbye!~%" win))
     (setf *window-list* (remove win *window-list*))
     (when (eql *drag-window* win)
       (setf *drag-window* nil))
@@ -629,15 +638,13 @@ A passive drag sends no drag events to the window.")
 
 ;;;; Window activation changed.
 
-(defclass window-activation-event ()
-  ((%window :initarg :window :reader window)
-   (%state :initarg :state :reader state)))
+(defclass window-activation-event (event)
+  ((%state :initarg :state :reader state)))
 
 ;;;; Window content updates.
 
-(defclass damage-event ()
-  ((%window :initarg :window :reader window)
-   (%x :initarg :x :reader x)
+(defclass damage-event (event)
+  ((%x :initarg :x :reader x)
    (%y :initarg :y :reader y)
    (%width :initarg :width :reader width)
    (%height :initarg :height :reader height)))
@@ -662,9 +669,8 @@ A passive drag sends no drag events to the window.")
 
 ;;;; Window dragging.
 
-(defclass begin-drag-event ()
-  ((%window :initarg :window :reader window)
-   (%mode :initarg :mode :reader mode)))
+(defclass begin-drag-event (event)
+  ((%mode :initarg :mode :reader mode)))
 
 (defmethod process-event ((event begin-drag-event))
   (let ((window (window event))
@@ -697,15 +703,13 @@ A passive drag sends no drag events to the window.")
 
 ;;;; Window resizing.
 
-(defclass resize-request-event ()
-  ((%window :initarg :window :reader window)
-   (%origin :initarg :origin :reader resize-origin)
+(defclass resize-request-event (event)
+  ((%origin :initarg :origin :reader resize-origin)
    (%width :initarg :width :reader width)
    (%height :initarg :height :reader height)))
 
-(defclass resize-event ()
-  ((%window :initarg :window :reader window)
-   (%origin :initarg :origin :reader resize-origin)
+(defclass resize-event (event)
+  ((%origin :initarg :origin :reader resize-origin)
    (%width :initarg :width :reader width)
    (%height :initarg :height :reader height)
    (%new-fb :initarg :new-fb :reader resize-new-fb)))
@@ -769,11 +773,28 @@ A passive drag sends no drag events to the window.")
                                           :origin origin
                                           :new-fb new-framebuffer)))
 
+;;;; Window move event.
+
+(defclass move-event ()
+  ((%window :initarg :window :reader window)
+   (%x      :initarg :x      :reader new-x)
+   (%y      :initarg :y      :reader new-y)))
+
+(defmethod process-event ((event move-event))
+  (let ((window (window event)))
+    (setf (window-x window) (new-x event)
+          (window-y window) (new-y event))))
+
+(defun move-window (window new-x new-y)
+  (submit-compositor-event (make-instance 'move-event
+                                          :window window
+                                          :x new-x
+                                          :y new-y)))
+
 ;;;; Window data.
 
-(defclass set-window-data-event ()
-  ((%window :initarg :window :reader window)
-   (%data :initarg :data :reader window-data)))
+(defclass set-window-data-event (event)
+  ((%data :initarg :data :reader window-data)))
 
 (defun lookup-cursor (cursor)
   (cond ((typep cursor 'mouse-cursor)
@@ -799,9 +820,8 @@ A passive drag sends no drag events to the window.")
 
 ;;;; Cursor control.
 
-(defclass grab-cursor-event ()
-  ((%window :initarg :window :reader window)
-   (%grabp :initarg :grabp :reader grabp)
+(defclass grab-cursor-event (event)
+  ((%grabp :initarg :grabp :reader grabp)
    (%x :initarg :x :reader x)
    (%y :initarg :y :reader y)
    (%width :initarg :width :reader width)
@@ -833,12 +853,12 @@ Only works when the window is active."
 
 ;;;; Quit event, sent by the compositor when the user wants to close the window.
 
-(defclass quit-event ()
-  ((%window :initarg :window :reader window)))
+(defclass quit-event (event)
+  ())
 
 ;;;; Internal redisplay timer event.
 
-(defclass redisplay-time-event ()
+(defclass redisplay-time-event (event)
   ((%fullp :initarg :full :reader redisplay-time-event-fullp))
   (:default-initargs :full nil))
 
@@ -850,9 +870,8 @@ Only works when the window is active."
 
 ;;;; Notifications.
 
-(defclass subscribe-event ()
-  ((%window :initarg :window :reader window)
-   (%category :initarg :category :reader category)))
+(defclass subscribe-event (event)
+  ((%category :initarg :category :reader category)))
 
 (defun subscribe-notification (window category)
   (submit-compositor-event (make-instance 'subscribe-event
@@ -867,9 +886,8 @@ Only works when the window is active."
                                               :width (mezzano.supervisor:framebuffer-width *main-screen*)
                                               :height (mezzano.supervisor:framebuffer-height *main-screen*))))))
 
-(defclass unsubscribe-event ()
-  ((%window :initarg :window :reader window)
-   (%category :initarg :category :reader category)))
+(defclass unsubscribe-event (event)
+  ((%category :initarg :category :reader category)))
 
 (defun unsubscribe-notification (window category)
   (submit-compositor-event (make-instance 'unsubscribe-event
@@ -888,7 +906,7 @@ Only works when the window is active."
 
 ;;;; Screen geometry change notification.
 
-(defclass screen-geometry-update ()
+(defclass screen-geometry-update (event)
   ((%width :initarg :width :reader width)
    (%height :initarg :height :reader height)))
 
@@ -1007,33 +1025,46 @@ Only works when the window is active."
         *clip-rect-width* 0
         *clip-rect-height* 0))
 
+(defun compositor-thread-body ()
+  (when (not (eql *main-screen* (mezzano.supervisor:current-framebuffer)))
+    ;; Framebuffer changed. Rebuild the screen.
+    (setf *main-screen* (mezzano.supervisor:current-framebuffer)
+          *screen-backbuffer* (mezzano.gui:make-surface
+                               (mezzano.supervisor:framebuffer-width *main-screen*)
+                               (mezzano.supervisor:framebuffer-height *main-screen*)))
+    (recompose-windows t)
+    (broadcast-notification :screen-geometry
+                            (make-instance 'screen-geometry-update
+                                           :width (mezzano.supervisor:framebuffer-width *main-screen*)
+                                           :height (mezzano.supervisor:framebuffer-height *main-screen*))))
+  (sys.int::log-and-ignore-errors
+    (process-event (mezzano.supervisor:fifo-pop *event-queue*))))
+
 (defun compositor-thread ()
-  (loop
-     (when (not (eql *main-screen* (mezzano.supervisor:current-framebuffer)))
-       ;; Framebuffer changed. Rebuild the screen.
-       (setf *main-screen* (mezzano.supervisor:current-framebuffer)
-             *screen-backbuffer* (mezzano.gui:make-surface
-                                  (mezzano.supervisor:framebuffer-width *main-screen*)
-                                  (mezzano.supervisor:framebuffer-height *main-screen*)))
-       (recompose-windows t)
-       (broadcast-notification :screen-geometry
-                               (make-instance 'screen-geometry-update
-                                              :width (mezzano.supervisor:framebuffer-width *main-screen*)
-                                              :height (mezzano.supervisor:framebuffer-height *main-screen*))))
-     (sys.int::log-and-ignore-errors
-       (process-event (mezzano.supervisor:fifo-pop *event-queue*)))))
+  (loop (compositor-thread-body)))
 
 (defvar *compositor-update-interval* 1/60)
+(defparameter *screensaver-spawn-function* nil)
+(defparameter *screensaver-time* (* 1 60))
+
+(defun compositor-heartbeat-thread-body ()
+  (sleep *compositor-update-interval*)
+  (when *screensaver-spawn-function*
+    (let ((old-idle *idle-time*))
+      (incf *idle-time* *compositor-update-interval*)
+      (when (and (< old-idle *screensaver-time*)
+                 (>= *idle-time* *screensaver-time*))
+        (ignore-errors
+          (funcall *screensaver-spawn-function*)))))
+  ;; Redisplay only when the system framebuffer changes or when there's
+  ;; nonempty clip rect.
+  (when (or (not (eql *main-screen* (mezzano.supervisor:current-framebuffer)))
+            (and (not (zerop *clip-rect-width*))
+                 (not (zerop *clip-rect-height*))))
+    (submit-compositor-event (make-instance 'redisplay-time-event))))
 
 (defun compositor-heartbeat-thread ()
-  (loop
-     (sleep *compositor-update-interval*)
-     ;; Redisplay only when the system framebuffer changes or when there's
-     ;; nonempty clip rect.
-     (when (or (not (eql *main-screen* (mezzano.supervisor:current-framebuffer)))
-               (and (not (zerop *clip-rect-width*))
-                    (not (zerop *clip-rect-height*))))
-       (submit-compositor-event (make-instance 'redisplay-time-event)))))
+  (loop (compositor-heartbeat-thread-body)))
 
 (when (not *compositor*)
   (setf *compositor* (mezzano.supervisor:make-thread 'compositor-thread

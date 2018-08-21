@@ -168,7 +168,7 @@
          (parent (vector-pop stack))
          (slots (vector-pop stack))
          (name (vector-pop stack))
-         (definition (get name 'structure-type)))
+         (definition (get-structure-type name nil)))
     (cond (definition
            (unless (and (eql (length (structure-slots definition)) (length slots))
                         (every #'structure-slot-definition-compatible (structure-slots definition) slots))
@@ -372,8 +372,6 @@
 (defun load-lisp-source (stream)
   (let ((*readtable* *readtable*)
         (*package* *package*)
-        (*load-truename* (ignore-errors (pathname stream)))
-        (*load-pathname* (ignore-errors (pathname stream)))
         (eof (cons nil nil)))
     (loop (let ((form (read stream nil eof)))
             (when (eql form eof) (return))
@@ -401,14 +399,16 @@
              (external-format :default)
              wired)
   (let ((*load-verbose* verbose)
-        (*load-print* print))
+        (*load-print* print)
+        ;; There is nothing in the spec about this, but I am sick of
+        ;; libraries fiddling with my optimize policy!
+        (sys.c::*optimize-policy* (copy-list sys.c::*optimize-policy*)))
     (cond ((streamp filespec)
            (let* ((*load-pathname* (ignore-errors (pathname filespec)))
-                  (*load-truename* (ignore-errors (pathname filespec))))
+                  (*load-truename* (ignore-errors (truename filespec))))
              (load-from-stream filespec wired)))
           (t (let* ((path (merge-pathnames filespec))
-                    (*load-pathname* (pathname path))
-                    (*load-truename* (pathname path)))
+                    (*load-pathname* (pathname path)))
                (with-open-file (stream filespec
                                        :if-does-not-exist (if if-does-not-exist
                                                               :error
@@ -420,7 +420,8 @@
                                                             :default
                                                             external-format))
                  (when stream
-                   (load-from-stream stream wired))))))))
+                   (let ((*load-truename* (truename stream)))
+                     (load-from-stream stream wired)))))))))
 
 (defun provide (module-name)
   (pushnew (string module-name) *modules*

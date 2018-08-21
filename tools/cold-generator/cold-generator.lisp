@@ -1,32 +1,6 @@
 ;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
 ;;;; This code is licensed under the MIT license.
 
-(defpackage :cold-generator
-  (:use :cl :iterate :nibbles)
-  (:export #:make-image
-           #:allocate
-           #:word
-           #:array-header
-           #:make-value
-           #:function-reference
-           #:symbol-address
-           #:cold-symbol-value
-           #:compile-lap-function
-           #:set-up-cross-compiler))
-
-(defpackage :cold-generator.x86-64
-  (:use :cl :cold-generator)
-  (:export #:*undefined-function-thunk*
-           #:*closure-trampoline*
-           #:*funcallable-instance-trampoline*
-           #:create-low-level-interrupt-support))
-
-(defpackage :cold-generator.arm64
-  (:use :cl :cold-generator)
-  (:export #:*undefined-function-thunk*
-           #:*closure-trampoline*
-           #:*funcallable-instance-trampoline*))
-
 (in-package :cold-generator)
 
 (defparameter *supervisor-source-files*
@@ -79,7 +53,9 @@
     "runtime/runtime.lisp"
     ("runtime/runtime-x86-64.lisp" :x86-64)
     ("runtime/runtime-arm64.lisp" :arm64)
+    "system/data-types.lisp"
     "runtime/allocate.lisp"
+    "runtime/cons.lisp"
     "runtime/numbers.lisp"
     ("runtime/float-x86-64.lisp" :x86-64)
     ("runtime/float-arm64.lisp" :arm64)
@@ -92,7 +68,6 @@
 
 (defparameter *source-files*
   '("system/cold-start.lisp"
-    "system/data-types.lisp"
     "system/defstruct.lisp"
     "system/cons.lisp"
     "system/sequence.lisp"
@@ -121,6 +96,8 @@
     "system/parse.lisp"
     "system/load.lisp"
     "system/time.lisp"
+    "system/delimited-continuations.lisp"
+    ("system/delimited-continuations-x86-64.lisp" :x86-64)
 ))
 
 (defparameter *special-source-files*
@@ -143,14 +120,16 @@
     "system/full-eval.lisp"
     "system/fast-eval.lisp"
     "system/eval.lisp"
+    "system/gray-streams.lisp"
+    "system/standard-streams.lisp"
     "system/stream.lisp"
     "system/ansi-loop.lisp"
     "system/environment.lisp"
     "compiler/package.lisp"
+    "compiler/compiler.lisp"
     "compiler/lap.lisp"
     "compiler/lap-x86.lisp"
     "compiler/lap-arm64.lisp"
-    "compiler/compiler.lisp"
     "compiler/environment.lisp"
     "compiler/global-environment.lisp"
     "compiler/ast.lisp"
@@ -163,6 +142,7 @@
     "compiler/kill-temps.lisp"
     "compiler/keyword-arguments.lisp"
     "compiler/simplify-arguments.lisp"
+    "compiler/dynamic-extent.lisp"
     "compiler/codegen-x86-64.lisp"
     "compiler/builtins-x86-64/builtins.lisp"
     "compiler/builtins-x86-64/array.lisp"
@@ -188,6 +168,35 @@
     "compiler/simplify-control-flow.lisp"
     "compiler/blexit.lisp"
     "compiler/transforms.lisp"
+    "compiler/backend/backend.lisp"
+    "compiler/backend/instructions.lisp"
+    "compiler/backend/cfg.lisp"
+    "compiler/backend/analysis.lisp"
+    "compiler/backend/dominance.lisp"
+    "compiler/backend/convert-ast.lisp"
+    "compiler/backend/multiple-values.lisp"
+    "compiler/backend/ssa.lisp"
+    "compiler/backend/passes.lisp"
+    "compiler/backend/debug.lisp"
+    "compiler/backend/register-allocation.lisp"
+    "compiler/backend/canon.lisp"
+    "compiler/backend/x86-64/x86-64.lisp"
+    "compiler/backend/x86-64/target.lisp"
+    "compiler/backend/x86-64/codegen.lisp"
+    "compiler/backend/x86-64/builtin.lisp"
+    "compiler/backend/x86-64/misc.lisp"
+    "compiler/backend/x86-64/object.lisp"
+    "compiler/backend/x86-64/memory.lisp"
+    "compiler/backend/x86-64/number.lisp"
+    "compiler/backend/x86-64/simd.lisp"
+    "compiler/backend/arm64/arm64.lisp"
+    "compiler/backend/arm64/target.lisp"
+    "compiler/backend/arm64/codegen.lisp"
+    "compiler/backend/arm64/builtin.lisp"
+    "compiler/backend/arm64/misc.lisp"
+    "compiler/backend/arm64/object.lisp"
+    "compiler/backend/arm64/number.lisp"
+    ("runtime/simd.lisp" :x86-64)
     "system/file-compiler.lisp"
     "system/xp-package.lisp"
     "system/xp.lisp"
@@ -219,15 +228,6 @@
 (defparameter *unicode-data* "tools/UnicodeData.txt")
 (defparameter *pci-ids* "tools/pci.ids")
 
-(defun compile-warm-source (&optional force)
-  (dolist (file *warm-source-files*)
-    (let ((llf-path (merge-pathnames (make-pathname :type "llf" :defaults file))))
-      (when (or (not (probe-file llf-path))
-                (<= (file-write-date llf-path) (file-write-date file))
-                force)
-        (format t "~A is out of date will be recompiled.~%" llf-path)
-        (sys.c::cross-compile-file file)))))
-
 (defvar *symbol-table*)
 (defvar *reverse-symbol-table*)
 ;; Hash-table mapping function names to function references.
@@ -248,10 +248,10 @@
 
 ;;; Memory allocation.
 
-;; Wired area starts at 2M.
-(defconstant +wired-area-base+ (* 2 1024 1024))
-;; Pinned at 2G.
-(defconstant +pinned-area-base+ (* 2 1024 1024 1024))
+;; Wired area starts near 0.
+(defconstant +wired-area-base+ sys.int::+allocation-minimum-alignment+)
+;; Pinned at 512G.
+(defconstant +pinned-area-base+ (* 512 1024 1024 1024))
 ;; Wired area stops at 2G, below the pinned area.
 (defconstant +wired-area-limit+ (* 2 1024 1024 1024))
 
@@ -279,6 +279,8 @@
 (defvar *cons-area-data*)
 (defvar *cons-area-store*)
 
+(defvar *card-offsets*)
+
 (defstruct stack
   base
   size
@@ -286,6 +288,7 @@
 
 (defvar *stack-list*)
 (defvar *stack-area-bump*)
+(defvar *stack-area-bytes*)
 
 (defvar *store-bump*)
 
@@ -297,35 +300,41 @@
   (incf value (1- boundary))
   (- value (rem value boundary)))
 
-(defun allocate-1 (size bump-symbol data-symbol data-offset limit tag name)
+(defun allocate-1 (size bump-symbol data-symbol data-offset limit tag name generation)
   (when (>= (+ (symbol-value bump-symbol) size) limit)
     (error "~A area exceeded limit." name))
-  (let ((address (symbol-value bump-symbol)))
+  (let ((address (logior (symbol-value bump-symbol)
+                         (ash tag sys.int::+address-tag-shift+)
+                         (cross-cl:dpb generation sys.int::+address-generation+ 0))))
     (incf (symbol-value bump-symbol) size)
     ;; Keep data vector page aligned, but don't expand it too often.
     ;; Keeping it 2MB aligned is important - WRITE-IMAGE relies on this to
     ;; provide zeros in unallocated parts of the area.
-    (let ((dv-size (align-up (symbol-value bump-symbol) #x200000)))
+    (let ((dv-size (align-up (symbol-value bump-symbol) sys.int::+allocation-minimum-alignment+)))
       (when (not (eql (- dv-size data-offset)
                       (length (symbol-value data-symbol))))
         (setf (symbol-value data-symbol) (adjust-array (symbol-value data-symbol)
                                                        (- dv-size data-offset)
                                                        :element-type '(unsigned-byte 8)
                                                        :initial-element 0))))
-    (/ (logior address (ash tag sys.int::+address-tag-shift+)) 8)))
+    ;; Update the card table starts.
+    (loop
+       for card from (align-up address sys.int::+card-size+) below (+ address size) by sys.int::+card-size+
+       do (setf (gethash card *card-offsets*) (cons (- address card) address)))
+    (/ address 8)))
 
 (defun allocate (word-count &optional area)
   (when (oddp word-count) (incf word-count))
   (let ((size (* word-count 8)))
     (ecase (or area *default-general-allocation-area*)
       (:wired
-       (allocate-1 size '*wired-area-bump* '*wired-area-data* +wired-area-base+ +wired-area-limit+ sys.int::+address-tag-pinned+ "wired"))
+       (allocate-1 size '*wired-area-bump* '*wired-area-data* +wired-area-base+ +wired-area-limit+ sys.int::+address-tag-pinned+ "wired" 0))
       (:pinned
-       (allocate-1 size '*pinned-area-bump* '*pinned-area-data* +pinned-area-base+ +area-limit+ sys.int::+address-tag-pinned+ "pinned"))
+       (allocate-1 size '*pinned-area-bump* '*pinned-area-data* +pinned-area-base+ +area-limit+ sys.int::+address-tag-pinned+ "pinned" 0))
       (:general
-       (allocate-1 size '*general-area-bump* '*general-area-data* 0 +area-limit+ sys.int::+address-tag-general+ "general"))
+       (allocate-1 size '*general-area-bump* '*general-area-data* 0 +area-limit+ sys.int::+address-tag-general+ "general" sys.int::+address-generation-2-a+))
       (:cons
-       (allocate-1 size '*cons-area-bump* '*cons-area-data* 0 +area-limit+ sys.int::+address-tag-cons+ "cons")))))
+       (allocate-1 size '*cons-area-bump* '*cons-area-data* 0 +area-limit+ sys.int::+address-tag-cons+ "cons" sys.int::+address-generation-2-a+)))))
 
 (defun area-for-address (address)
   (let ((byte-address (* address 8)))
@@ -356,6 +365,7 @@
   (let* ((address (logior (ash sys.int::+address-tag-stack+ sys.int::+address-tag-shift+)
                           *stack-area-bump*))
          (info (make-stack :base address :size size)))
+    (incf *stack-area-bytes* size)
     (incf *stack-area-bump* (align-up size #x200000))
     (push info *stack-list*)
     info))
@@ -379,11 +389,10 @@
 
 (defun assemble (code-list &rest args)
   (let ((sys.lap:*function-reference-resolver* #'sys.c::resolve-fref))
-    (ecase sys.c::*target-architecture*
-      (:x86-64
-       (apply #'sys.lap-x86:assemble code-list args))
-      (:arm64
-       (apply #'mezzano.lap.arm64:assemble code-list args)))))
+    (apply #'sys.lap:perform-assembly-using-target
+           (sys.c::canonicalize-target sys.c::*target-architecture*)
+           code-list
+           args)))
 
 (defun compile-lap-function (code &key (area *default-pinned-allocation-area*) extra-symbols constant-values (position-independent t) (name 'sys.int::support-function))
   "Compile a list of LAP code as a function. Constants must only be symbols."
@@ -399,7 +408,10 @@
           ;; Name & debug info.
           :info (list name nil))
       (declare (ignore symbols))
-      (setf mc (adjust-array mc (* (ceiling (length mc) 16) 16) :fill-pointer t))
+      (setf mc (let ((array (make-array (* (ceiling (length mc) 16) 16)
+                                        :fill-pointer t
+                                        :element-type '(unsigned-byte 8))))
+                 (replace array mc)))
       (let ((total-size (+ (* (truncate (length mc) 16) 2)
                            (length constants)
                            (ceiling (length gc-info) 8))))
@@ -409,12 +421,7 @@
           (dotimes (i (truncate (length mc) 8))
             (setf (word (+ address i)) (nibbles:ub64ref/le mc (* i 8))))
           ;; Set header word.
-          (setf (word address) 0)
-          (setf (ldb (byte 16 0) (word address)) (ash sys.int::+object-tag-function+
-                                                      sys.int::+object-type-shift+) ; tag
-                (ldb (byte 16 16) (word address)) (truncate (length mc) 16)
-                (ldb (byte 16 32) (word address)) (length constants)
-                (ldb (byte 16 48) (word address)) (length gc-info))
+          (setf (word address) (function-header (- (length mc) 16) (length constants) (length gc-info)))
           (setf (word (1+ address)) (* (+ address 2) 8))
           ;; Copy GC bytes.
           (setf gc-info (adjust-array gc-info (* (ceiling (length gc-info) 8) 8)))
@@ -485,6 +492,7 @@
     object-address))
 
 (defun symbol-address (name package &optional (createp t))
+  (setf package (canonical-package-name package))
   (or (gethash (cons name package) *symbol-table*)
       (when (not createp)
         (error "Symbol ~A::~A does not exist."
@@ -603,6 +611,53 @@
           (word (+ addr 6)) read-only)
     (make-value addr sys.int::+tag-object+)))
 
+(defun vmake-structure (type &rest initargs &key &allow-other-keys)
+  ;; Look up the associated structure definition.
+  (let* ((def (sys.int::get-structure-type type))
+         (n-slots (length (sys.c::structure-type-slots def)))
+         (address (allocate (+ 2 n-slots) ; header + type + slots
+                            (sys.c::structure-type-area def))))
+    ;; header
+    (setf (word (+ address 0)) (array-header sys.int::+object-tag-structure-object+ (1+ n-slots))) ; includes type
+    ;; type
+    (setf (word (+ address 1)) (make-value (first (or (gethash type *struct-table*)
+                                                      (error "Missing structure ~S?" type)))
+                                           sys.int::+tag-object+))
+    ;; Initialize slots to NIL.
+    (loop
+       for i from 2
+       repeat n-slots
+       do
+         (setf (word (+ address i)) (vsym nil)))
+    ;; Populate from initargs.
+    (loop
+       for (name value) on initargs by #'cddr
+       ;; Initargs are keywords, slot names are other symbols.
+       ;; Hack around this by comparing symbol names.
+       for loc = (or (position name (sys.c::structure-type-slots def)
+                               :test #'string=
+                               :key #'sys.c::structure-slot-name)
+                     (error "Unknown slot ~S in structure ~S" name type))
+       do
+         (format t "Position of slot ~S in ~S is ~S @ ~X~%" name type loc (+ address 2 loc))
+         (setf (word (+ address 2 loc)) value))
+    (make-value address sys.int::+tag-object+)))
+
+(defun structure-slot (object type slot)
+  (let* ((def (sys.int::get-structure-type type))
+         (index (or (position slot (sys.c::structure-type-slots def)
+                              :key #'sys.c::structure-slot-name)
+                    (error "Unknown slot ~S in structure ~S" slot type))))
+    (word (+ (pointer-part object) 2 index))))
+
+(defun (setf structure-slot) (value object type slot)
+  (let* ((def (sys.int::get-structure-type type))
+         (index (or (position slot (sys.c::structure-type-slots def)
+                              :key #'sys.c::structure-slot-name)
+                    (error "Unknown slot ~S in structure ~S" slot type))))
+    (format t "Position of slot ~S in ~S is ~S (setf) @ ~X~%" slot type index (+ (truncate object 8) 2 index))
+    (setf (word (+ (pointer-part object) 2 index)) value)))
+
 (defun add-page-to-block-map (bml4 block virtual-address flags)
   (let ((bml4e (ldb (byte 9 39) virtual-address))
         (bml3e (ldb (byte 9 30) virtual-address))
@@ -649,6 +704,37 @@
       (read-sequence data s)
       data)))
 
+(defun write-card-table (stream image-offset bml4 start size)
+  (assert (zerop (rem start sys.int::+allocation-minimum-alignment+)))
+  (assert (zerop (rem size sys.int::+allocation-minimum-alignment+)))
+  (let ((table (make-array (* (/ size sys.int::+card-size+) sys.int::+card-table-entry-size+)
+                           :element-type '(unsigned-byte 8)
+                           :initial-element 0))
+        (store-base *store-bump*))
+    (loop
+       for i below size by sys.int::+card-size+
+       for offset = (car (or (gethash (+ start i) *card-offsets*)
+                             (error "Missing card offset for address ~X" (+ start i))))
+       do
+         (assert (not (plusp offset)))
+         (assert (not (logtest offset 15)))
+         (setf (nibbles:ub32ref/le table (* (/ i sys.int::+card-size+) sys.int::+card-table-entry-size+))
+               (cross-cl:dpb (min (1- (expt 2 (cross-cl:byte-size sys.int::+card-table-entry-offset+)))
+                                  (/ (- offset) 16))
+                             sys.int::+card-table-entry-offset+
+                             0)))
+    (file-position stream (+ image-offset store-base))
+    (write-sequence table stream)
+    (incf *store-bump* (length table))
+    (add-region-to-block-map bml4
+                             (/ store-base #x1000)
+                             (+ sys.int::+card-table-base+
+                                (* (/ start sys.int::+card-size+) sys.int::+card-table-entry-size+))
+                             (/ (* (/ size sys.int::+card-size+) sys.int::+card-table-entry-size+) #x1000)
+                             (logior sys.int::+block-map-present+
+                                     sys.int::+block-map-writable+
+                                     sys.int::+block-map-wired+))))
+
 (defun write-image (s entry-fref initial-thread image-size header-path uuid)
   (format t "Writing image file to ~A.~%" (namestring s))
   (let* ((image-header-data (when header-path
@@ -692,7 +778,7 @@
       ;; Major version.
       (setf (ub16ref/le header 32) 0)
       ;; Minor version.
-      (setf (ub16ref/le header 34) 23)
+      (setf (ub16ref/le header 34) 24)
       ;; Entry fref.
       (setf (ub64ref/le header 40) entry-fref)
       ;; Initial thread.
@@ -730,44 +816,45 @@
             *cons-area-store* (length *cons-area-data*))
     (file-position s (+ image-offset *cons-area-store*))
     (write-sequence *cons-area-data* s)
+    ;; Write initial card table. Includes adding it to the block map.
+    (write-card-table s image-offset bml4 +wired-area-base+ (- *wired-area-bump* +wired-area-base+))
+    (write-card-table s image-offset bml4 +pinned-area-base+ (- *pinned-area-bump* +pinned-area-base+))
+    (write-card-table s image-offset bml4 (logior (ash sys.int::+address-tag-general+ sys.int::+address-tag-shift+)
+                                                  (cross-cl:dpb sys.int::+address-generation-2-a+ sys.int::+address-generation+ 0))
+                      *general-area-bump*)
+    (write-card-table s image-offset bml4 (logior (ash sys.int::+address-tag-cons+ sys.int::+address-tag-shift+)
+                                                  (cross-cl:dpb sys.int::+address-generation-2-a+ sys.int::+address-generation+ 0))
+                      *cons-area-bump*)
     ;; Generate the block map.
     (add-region-to-block-map bml4
                              (/ *wired-area-store* #x1000)
                              +wired-area-base+
-                             (/ (- (align-up *wired-area-bump* #x200000) +wired-area-base+) #x1000)
+                             (/ (- (align-up *wired-area-bump* sys.int::+allocation-minimum-alignment+) +wired-area-base+) #x1000)
                              (logior sys.int::+block-map-present+
                                      sys.int::+block-map-writable+
                                      sys.int::+block-map-wired+))
     (add-region-to-block-map bml4
                              (/ *pinned-area-store* #x1000)
                              +pinned-area-base+
-                             (/ (- (align-up *pinned-area-bump* #x200000) +pinned-area-base+) #x1000)
+                             (/ (- (align-up *pinned-area-bump* sys.int::+allocation-minimum-alignment+) +pinned-area-base+) #x1000)
                              (logior sys.int::+block-map-present+
                                      sys.int::+block-map-writable+))
     (add-region-to-block-map bml4
                              (/ *general-area-store* #x1000)
-                             (ash sys.int::+address-tag-general+ sys.int::+address-tag-shift+)
-                             (/ (align-up *general-area-bump* #x200000) #x1000)
-                             (logior sys.int::+block-map-present+
-                                     sys.int::+block-map-writable+))
-    (add-region-to-block-map bml4
-                             (/ (+ *general-area-store* (align-up *general-area-bump* #x200000)) #x1000)
                              (logior (ash sys.int::+address-tag-general+ sys.int::+address-tag-shift+)
-                                     (ash 1 sys.int::+address-newspace/oldspace-bit+))
-                             (/ (align-up *general-area-bump* #x200000) #x1000)
-                             (logior sys.int::+block-map-zero-fill+))
+                                     (cross-cl:dpb sys.int::+address-generation-2-a+ sys.int::+address-generation+ 0))
+                             (/ (align-up *general-area-bump* sys.int::+allocation-minimum-alignment+) #x1000)
+                             (logior sys.int::+block-map-present+
+                                     sys.int::+block-map-writable+
+                                     sys.int::+block-map-track-dirty+))
     (add-region-to-block-map bml4
                              (/ *cons-area-store* #x1000)
-                             (ash sys.int::+address-tag-cons+ sys.int::+address-tag-shift+)
-                             (/ (align-up *cons-area-bump* #x200000) #x1000)
-                             (logior sys.int::+block-map-present+
-                                     sys.int::+block-map-writable+))
-    (add-region-to-block-map bml4
-                             (/ (+ *cons-area-store* (align-up *cons-area-bump* #x200000)) #x1000)
                              (logior (ash sys.int::+address-tag-cons+ sys.int::+address-tag-shift+)
-                                     (ash 1 sys.int::+address-newspace/oldspace-bit+))
-                             (/ (align-up *cons-area-bump* #x200000) #x1000)
-                             (logior sys.int::+block-map-zero-fill+))
+                                     (cross-cl:dpb sys.int::+address-generation-2-a+ sys.int::+address-generation+ 0))
+                             (/ (align-up *cons-area-bump* sys.int::+allocation-minimum-alignment+) #x1000)
+                             (logior sys.int::+block-map-present+
+                                     sys.int::+block-map-writable+
+                                     sys.int::+block-map-track-dirty+))
     (dolist (stack *stack-list*)
       (add-region-to-block-map bml4
                                (/ (stack-store stack) #x1000)
@@ -844,6 +931,16 @@
         (create-thread "Initial thread"
                        :stack-size (* 16 1024)
                        :initial-state :active)))
+
+(defun canonical-package-name (package-name)
+  (cond ((or (string= package-name "CL")
+             (string= package-name "COMMON-LISP"))
+         "COMMON-LISP")
+        ((string= package-name "KEYWORD")
+         "KEYWORD")
+        (t
+         (package-name (or (find-package package-name)
+                           (error "Unknown package ~S" package-name))))))
 
 (defun canonical-symbol-package (symbol)
   (when (keywordp symbol)
@@ -922,11 +1019,35 @@
                                             (format nil "~A" name)
                                             "#\\Newline"))))))
 
+(defun build-directory ()
+  (merge-pathnames (make-pathname :directory `(:relative ,(format nil "~(build-~A~)" sys.c::*target-architecture*)))))
+
 ;; Ugh.
 (defun load-compiler-builtins ()
-  (sys.c::save-compiler-builtins "%%compiler-builtins.llf"
-                                 sys.c::*target-architecture*)
-  (load-source-file "%%compiler-builtins.llf" t t))
+  (let ((llf-path (merge-pathnames "%%compiler-builtins.llf"
+                                   (build-directory))))
+    (ensure-directories-exist llf-path)
+    (sys.c::save-compiler-builtins llf-path
+                                   sys.c::*target-architecture*)
+    (load-source-file llf-path t t)))
+
+(defun maybe-compile-file (path)
+  (let ((llf-path (merge-pathnames (make-pathname :type "llf" :defaults path)
+                                   (build-directory))))
+    (ensure-directories-exist llf-path)
+    (with-open-file (s llf-path
+                       :element-type '(unsigned-byte 8)
+                       :if-does-not-exist nil)
+      (when s
+        (handler-case (validate-llf-header s)
+          (invalid-llf (c)
+            (format t "Rebuilding ~A: ~A~%" llf-path c)
+            (delete-file s)))))
+    (when (or (not (probe-file llf-path))
+              (<= (file-write-date llf-path) (file-write-date path)))
+      (format t "~A is out of date will be recompiled.~%" llf-path)
+      (sys.c::cross-compile-file path :output-file llf-path))
+    llf-path))
 
 (defun save-ub1-vector (vec &optional area)
   (let ((address (allocate (1+ (ceiling (length vec) 64)) area)))
@@ -1076,8 +1197,19 @@
         (pinned-free-bins (allocate (1+ 64) :wired))
         ;; Ensure a minium amount of free space in :wired.
         ;; And :pinned as well, but that matters less.
-        (wired-free-area (allocate (* 4 1024 1024) :wired))
-        (pinned-free-area (allocate 4 :pinned)))
+        (wired-free-area (allocate (* 8 1024 1024) :wired))
+        (pinned-free-area (allocate (* 1 1024 1024) :pinned)))
+    ;; Allocate enough to align the area sizes up to the allocation alignment.
+    (flet ((align (area area-bump)
+             (allocate (/ (- sys.int::+allocation-minimum-alignment+
+                             (rem area-bump
+                                  sys.int::+allocation-minimum-alignment+))
+                          8)
+                       area)))
+      (align :wired *wired-area-bump*)
+      (align :pinned *pinned-area-bump*)
+      (align :general *general-area-bump*)
+      (align :cons *cons-area-bump*))
     (setf (word wired-free-bins) (array-header sys.int::+object-tag-array-t+ 64)
           (word pinned-free-bins) (array-header sys.int::+object-tag-array-t+ 64))
     (dotimes (i 64)
@@ -1085,31 +1217,33 @@
       (setf (word (+ pinned-free-bins 1 i)) (vsym nil)))
     (setf (cold-symbol-value 'sys.int::*wired-area-free-bins*) (make-value wired-free-bins sys.int::+tag-object+)
           (cold-symbol-value 'sys.int::*pinned-area-free-bins*) (make-value pinned-free-bins sys.int::+tag-object+))
-    (setf *wired-area-bump* (align-up *wired-area-bump* #x200000))
+    (setf *wired-area-bump* (align-up *wired-area-bump* sys.int::+allocation-minimum-alignment+))
     (let ((wired-size (truncate (- *wired-area-bump* (ldb (byte 44 0) (* wired-free-area 8))) 8)))
       (setf (word wired-free-area) (logior (ash sys.int::+object-tag-freelist-entry+ sys.int::+object-type-shift+)
                                            (ash wired-size sys.int::+object-data-shift+))
             (word (1+ wired-free-area)) (make-value (symbol-address "NIL" "COMMON-LISP") sys.int::+tag-object+))
       (setf (word (+ wired-free-bins 1 (integer-length wired-size))) (make-fixnum (* wired-free-area 8))))
-    (setf *pinned-area-bump* (align-up *pinned-area-bump* #x200000))
+    (setf *pinned-area-bump* (align-up *pinned-area-bump* sys.int::+allocation-minimum-alignment+))
     (let ((pinned-size (truncate (- *pinned-area-bump* (ldb (byte 44 0) (* pinned-free-area 8))) 8)))
       (setf (word pinned-free-area) (logior (ash sys.int::+object-tag-freelist-entry+ sys.int::+object-type-shift+)
                                             (ash pinned-size sys.int::+object-data-shift+))
             (word (1+ pinned-free-area)) (make-value (symbol-address "NIL" "COMMON-LISP") sys.int::+tag-object+))
       (setf (word (+ pinned-free-bins 1 (integer-length pinned-size))) (make-fixnum (* pinned-free-area 8))))
-    (setf *wired-area-bump* (align-up *wired-area-bump* #x200000))
     (setf *wired-area-store* *store-bump*)
     (incf *store-bump* (- *wired-area-bump* +wired-area-base+))
-    (setf *pinned-area-bump* (align-up *pinned-area-bump* #x200000))
     (setf *pinned-area-store* *store-bump*)
     (incf *store-bump* (- *pinned-area-bump* +pinned-area-base+))
     (setf *general-area-store* *store-bump*)
-    (incf *store-bump* (* (align-up *general-area-bump* #x200000) 2))
+    (incf *store-bump* (* (align-up *general-area-bump* sys.int::+allocation-minimum-alignment+) 2))
     (setf *cons-area-store* *store-bump*)
-    (incf *store-bump* (* (align-up *cons-area-bump* #x200000) 2))
+    (incf *store-bump* (* (align-up *cons-area-bump* sys.int::+allocation-minimum-alignment+) 2))
     (dolist (stack *stack-list*)
       (setf (stack-store stack) *store-bump*)
-      (incf *store-bump* (stack-size stack)))))
+      (incf *store-bump* (stack-size stack)))
+    (assert (zerop (rem *wired-area-bump* sys.int::+allocation-minimum-alignment+)))
+    (assert (zerop (rem *pinned-area-bump* sys.int::+allocation-minimum-alignment+)))
+    (assert (zerop (rem *general-area-bump* sys.int::+allocation-minimum-alignment+)))
+    (assert (zerop (rem *cons-area-bump* sys.int::+allocation-minimum-alignment+)))))
 
 (defun generate-uuid ()
   (let ((uuid (make-array 16 :element-type '(unsigned-byte 8))))
@@ -1152,6 +1286,12 @@
      ;; Fifth group. Not byteswapped.
      (b 24) (b 26) (b 28) (b 30) (b 32) (b 34))))
 
+(defun git-revision ()
+  "Return the current git hash as a string or NIL if it can't be determined."
+  (ignore-errors
+    (values (uiop/run-program:run-program '("git" "rev-parse" "HEAD")
+                                          :output '(:string :stripped t)))))
+
 (defun make-image (image-name &key extra-source-files header-path image-size map-file-name (architecture :x86-64) uuid)
   (cond ((stringp uuid)
          (setf uuid (parse-uuid uuid)))
@@ -1172,6 +1312,7 @@
          (*cons-area-data* (make-array #x1000 :element-type '(unsigned-byte 8) :adjustable t))
          (*cons-area-store* nil)
          (*stack-area-bump* 0)
+         (*stack-area-bytes* 0)
          (*stack-list* '())
          (*store-bump* #x1000) ; header is 4k
          (*word-locks* (make-hash-table))
@@ -1190,7 +1331,8 @@
          (pf-exception-stack (create-stack (* 128 1024)))
          (irq-stack (create-stack (* 128 1024)))
          (wired-stack (create-stack (* 128 1024)))
-         (*image-to-cross-slot-definitions* (make-hash-table)))
+         (*image-to-cross-slot-definitions* (make-hash-table))
+         (*card-offsets* (make-hash-table)))
     ;; Generate the support objects. NIL/T/etc, and the initial thread.
     (create-support-objects)
     (ecase sys.c::*target-architecture*
@@ -1244,11 +1386,12 @@
                                              (or (not (consp x))
                                                  (member sys.c::*target-architecture* (rest x))))
                                            *warm-source-files*)))
-        (let ((llf-path (merge-pathnames (make-pathname :type "llf" :defaults file))))
-          (when (or (not (probe-file llf-path))
-                    (<= (file-write-date llf-path) (file-write-date file)))
-            (format t "~A is out of date will be recompiled.~%" llf-path)
-            (sys.c::cross-compile-file file))
+        ;; HACK! Force use of the new compiler building the SIMD/float functions.
+        (let ((sys.c::*use-new-compiler* (if (member file '("runtime/simd.lisp"
+                                                            "runtime/float-x86-64.lisp"))
+                                             t
+                                             sys.c::*use-new-compiler*))
+              (llf-path (maybe-compile-file file)))
           (format t "Loading ~A.~%" llf-path)
           (with-open-file (warm llf-path :element-type '(unsigned-byte 8))
             (let ((vec (make-array (file-length warm) :element-type '(unsigned-byte 8))))
@@ -1282,6 +1425,7 @@
             sys.int::*structure-slot-type*
             sys.int::*wired-area-free-bins*
             sys.int::*pinned-area-free-bins*
+            sys.int::*bytes-allocated-to-stacks*
             ))
     (loop
        for (what address byte-offset type debug-info) in *pending-fixups*
@@ -1314,6 +1458,11 @@
                                    :element-type '(unsigned-byte 64)
                                    :initial-element 0)
                        :wired))
+    (let ((git-rev (git-revision)))
+      (setf (cold-symbol-value 'sys.int::*git-revision*)
+            (if git-rev
+                (make-value (store-string git-rev) sys.int::+tag-object+)
+                (vsym nil))))
     ;; Make sure there's a keyword for each package.
     (iter (for ((nil . package-name) nil) in-hashtable *symbol-table*)
           (symbol-address package-name "KEYWORD"))
@@ -1323,21 +1472,30 @@
     (generate-obarray *symbol-table* 'sys.int::*initial-obarray*)
     (generate-fref-obarray *fref-table* 'sys.int::*initial-fref-obarray*)
     (generate-struct-obarray *struct-table* 'sys.int::*initial-structure-obarray*)
-    (finalize-areas)
-    ;; Initialize GC twiddly bits and stuff.
-    (flet ((set-value (symbol value)
-             (format t "~A is ~X~%" symbol value)
-             (setf (cold-symbol-value symbol) (make-fixnum value))))
-      (set-value 'sys.int::*wired-area-bump* *wired-area-bump*)
-      (set-value 'sys.int::*pinned-area-bump* *pinned-area-bump*)
-      (set-value 'sys.int::*general-area-bump* *general-area-bump*)
-      (set-value 'sys.int::*cons-area-bump* *cons-area-bump*)
-      (set-value 'sys.int::*wired-stack-area-bump* *stack-area-bump*)
-      (set-value 'sys.int::*stack-area-bump* +stack-area-base+))
+    (let ((actual-general-area-bump *general-area-bump*)
+          (actual-cons-area-bump *cons-area-bump*))
+      (finalize-areas)
+      ;; Initialize GC twiddly bits and stuff.
+      (flet ((set-value (symbol value)
+               (format t "~A is ~X~%" symbol value)
+               (setf (cold-symbol-value symbol) (make-fixnum value))))
+        (set-value 'sys.int::*wired-area-base* +wired-area-base+)
+        (set-value 'sys.int::*wired-area-bump* *wired-area-bump*)
+        (set-value 'sys.int::*pinned-area-base* +pinned-area-base+)
+        (set-value 'sys.int::*pinned-area-bump* *pinned-area-bump*)
+        (set-value 'sys.int::*general-area-bump* actual-general-area-bump)
+        (set-value 'sys.int::*general-area-limit* *general-area-bump*)
+        (set-value 'sys.int::*cons-area-bump* actual-cons-area-bump)
+        (set-value 'sys.int::*cons-area-limit* *cons-area-bump*)
+        (set-value 'sys.int::*wired-stack-area-bump* *stack-area-bump*)
+        (set-value 'sys.int::*stack-area-bump* +stack-area-base+)
+        (set-value 'sys.int::*bytes-allocated-to-stacks* *stack-area-bytes*)))
     (setf (cold-symbol-value 'sys.int::*structure-type-type*) (make-value *structure-definition-definition* sys.int::+tag-object+))
     (setf (cold-symbol-value 'sys.int::*structure-slot-type*) (make-value *structure-slot-definition-definition* sys.int::+tag-object+))
     (apply-fixups *pending-fixups*)
-    (write-map-file (or map-file-name (format nil "~A.map" image-name)) *function-map*)
+    (write-map-file (merge-pathnames (or map-file-name (format nil "~A.map" image-name))
+                                     (build-directory))
+                    *function-map*)
     (format t "UUID ~/cold-generator::format-uuid/~%" uuid)
     (if (streamp image-name)
         (write-image image-name
@@ -1347,7 +1505,8 @@
                      image-size
                      header-path
                      uuid)
-        (with-open-file (s (make-pathname :type "image" :defaults image-name)
+        (with-open-file (s (merge-pathnames (make-pathname :type "image" :defaults image-name)
+                                            (build-directory))
                            :direction :output
                            :element-type '(unsigned-byte 8)
                            :if-exists :supersede)
@@ -1367,8 +1526,6 @@
           (t
            (load-source-file f set-fdefinitions wired)))))
 
-(defvar *load-should-set-fdefinitions*)
-
 (defun make-bignum (value)
   (let* ((length (ceiling (1+ (integer-length value)) 64))
          (address (allocate (1+ length))))
@@ -1376,85 +1533,6 @@
     (dotimes (i length)
       (setf (word (+ address 1 i)) (ldb (byte 64 (* i 64)) value)))
     (make-value address sys.int::+tag-object+)))
-
-;;; Mostly duplicated from the file compiler...
-(defun load-integer (stream)
-  (let ((value 0) (shift 0))
-    (loop
-         (let ((b (read-byte stream)))
-           (when (not (logtest b #x80))
-             (setf value (logior value (ash (logand b #x3F) shift)))
-             (if (logtest b #x40)
-                 (return (- value))
-                 (return value)))
-           (setf value (logior value (ash (logand b #x7F) shift)))
-           (incf shift 7)))))
-
-(defun utf8-sequence-length (byte)
-  (cond
-    ((eql (logand byte #x80) #x00)
-     (values 1 byte))
-    ((eql (logand byte #xE0) #xC0)
-     (values 2 (logand byte #x1F)))
-    ((eql (logand byte #xF0) #xE0)
-     (values 3 (logand byte #x0F)))
-    ((eql (logand byte #xF8) #xF0)
-     (values 4 (logand byte #x07)))
-    (t (error "Invalid UTF-8 lead byte ~S." byte))))
-
-(defun load-character (stream)
-  (multiple-value-bind (length value)
-      (utf8-sequence-length (read-byte stream))
-    ;; Read remaining bytes. They must all be continuation bytes.
-    (dotimes (i (1- length))
-      (let ((byte (read-byte stream)))
-        (unless (eql (logand byte #xC0) #x80)
-          (error "Invalid UTF-8 continuation byte ~S." byte))
-        (setf value (logior (ash value 6) (logand byte #x3F)))))
-    value))
-
-(defun load-ub8-vector (stream)
-  (let* ((len (load-integer stream))
-         (seq (make-array len :element-type '(unsigned-byte 8))))
-    (read-sequence seq stream)
-    seq))
-
-(defun load-string (stream)
-  (let* ((len (load-integer stream))
-         (string-data (make-array len :element-type '(unsigned-byte 32)))
-         (min-width 1))
-    ;; Read all characters and figure out how wide the data vector must be.
-    (dotimes (i len)
-      (let ((ch (load-character stream)))
-        (setf (aref string-data i) ch)
-        (setf min-width (max min-width
-                             (cond ((>= ch (expt 2 16)) 4)
-                                   ((>= ch (expt 2 8)) 2)
-                                   (t 1))))))
-    (let* ((as-string (map 'string #'code-char string-data))
-           (existing (gethash as-string *string-dedup-table*)))
-      (unless existing
-        (let ((object-address (allocate 6))
-              (data-value (ecase min-width
-                            (4 (save-ub32-vector string-data))
-                            (2 (save-ub16-vector string-data))
-                            (1 (save-ub8-vector string-data)))))
-          ;; String container
-          (setf (word (+ object-address 0)) (array-header sys.int::+object-tag-string+ 1)
-                (word (+ object-address 1)) data-value
-                (word (+ object-address 2)) (make-value (symbol-address "NIL" "COMMON-LISP") sys.int::+tag-object+)
-                (word (+ object-address 3)) (make-value (symbol-address "NIL" "COMMON-LISP") sys.int::+tag-object+)
-                (word (+ object-address 4)) (make-fixnum len))
-          (setf existing (make-value object-address sys.int::+tag-object+)
-                (gethash as-string *string-dedup-table*) existing)))
-      existing)))
-
-(defun load-string* (stream)
-  (let* ((len (load-integer stream))
-         (seq (make-array len :element-type 'character)))
-    (dotimes (i len)
-      (setf (aref seq i) (code-char (load-character stream))))
-    seq))
 
 (defun structure-slot-equal (x y)
   (and (eql (sys.c::structure-slot-name x)
@@ -1472,24 +1550,6 @@
     (unless (and (eql (length definition-slots) (length slots))
                  (every #'structure-slot-equal slots definition-slots))
       (error "Incompatible redefinition of structure. ~S ~S~%" definition slots))))
-
-(defun load-structure-definition (name* slots* parent* area*)
-  (let* ((name (extract-object name*))
-         (slots (extract-object slots*))
-         (definition (gethash name *struct-table*)))
-    (cond (definition
-           (ensure-structure-layout-compatible definition slots)
-           (make-value (first definition) sys.int::+tag-object+))
-          (t (let ((address (allocate 7 :wired)))
-               (setf (word address) (array-header sys.int::+object-tag-structure-object+ 6))
-               (setf (word (+ address 1)) (make-value *structure-definition-definition* sys.int::+tag-object+))
-               (setf (word (+ address 2)) name*)
-               (setf (word (+ address 3)) slots*)
-               (setf (word (+ address 4)) parent*)
-               (setf (word (+ address 5)) area*)
-               (setf (word (+ address 6)) (make-value (symbol-address "NIL" "COMMON-LISP") sys.int::+tag-object+))
-               (setf (gethash name *struct-table*) (list address name slots))
-               (make-value address sys.int::+tag-object+))))))
 
 (defun extract-array (address element-width)
   (let* ((size (ldb (byte 56 8) (word address)))
@@ -1528,8 +1588,17 @@
       (#.sys.int::+tag-character+
        (code-char (ash value -4)))
       (#.sys.int::+tag-cons+
-       (cons (extract-object (word address))
-             (extract-object (word (1+ address)))))
+       ;; Avoid recursing down lists.
+       (let* ((result (cons nil nil))
+              (tail result))
+         (loop
+            (setf (cdr tail) (cons (extract-object (word address)) :incomplete)
+                  tail (cdr tail))
+            (setf value (word (1+ address))
+                  address (pointer-part value))
+            (when (not (eql (tag-part value) sys.int::+tag-cons+))
+              (setf (cdr tail) (extract-object value))
+              (return (cdr result))))))
       (#.sys.int::+tag-object+
        (let* ((header (word address))
               (tag (ldb (byte sys.int::+object-type-size+
@@ -1580,126 +1649,14 @@
       (vcons arg (apply 'vlist* args))
       arg))
 
-(defun cross-value-p (value)
-  (and (consp value)
-       (eql (first value) :cross-value)))
-
-(defun convert-host-tree-to-cross (tree)
-  (cond ((cross-value-p tree)
-         (second tree))
-        ((consp tree)
-         (vcons (convert-host-tree-to-cross (car tree))
-                (convert-host-tree-to-cross (cdr tree))))
-        ((symbolp tree)
-         (vintern (symbol-name tree)
-                  (canonical-symbol-package tree)))
-        (t
-         (error "Unsupported object ~S" tree))))
-
-(defun stack-pop (stack &optional (evaluation-mode :force))
-  (let ((value (vector-pop stack)))
-    (cond ((integerp value)
-           (if (eql evaluation-mode :lazy)
-               `(:cross-value ,value)
-               value))
-          (t
-           (ecase evaluation-mode
-             (:force
-              ;; TODO: Evaluate if possible, error otherwise.
-              (error "Force evaluation of ~S." value))
-             (:load
-              ;; Put it in load-time-evals.
-              ;; TODO: Try to constant-fold as much as possible.
-              (push (convert-host-tree-to-cross (first value))
-                    *load-time-evals*)
-              nil)
-             (:lazy
-              (first value)))))))
-
-(defun load-llf-function (stream stack)
-  ;; n constants on stack.
-  ;; list of fixups on stack.
-  ;; +llf-function+
-  ;; tag. (byte)
-  ;; mc size in bytes. (integer)
-  ;; number of constants. (integer)
-  ;; gc-info-length in bytes. (integer)
-  ;; mc
-  ;; gc-info
-  (let* ((tag (read-byte stream))
-         (mc-length (load-integer stream))
-         ;; mc-length does not include the 16 byte function header.
-         (mc (make-array (* (ceiling (+ mc-length 16) 8) 8)
-                         :element-type '(unsigned-byte 8)
-                         :initial-element 0))
-         (n-constants (load-integer stream))
-         (gc-info-length (load-integer stream))
-         (gc-info (make-array (* (ceiling gc-info-length 8) 8)
-                              :element-type '(unsigned-byte 8)))
-         (fixups (stack-pop stack))
-         ;; Pull n constants off the value stack.
-         (constants (reverse (loop
-                                repeat n-constants
-                                collect (stack-pop stack))))
-         (total-size (+ (* (ceiling (+ mc-length 16) 16) 2)
-                        n-constants
-                        (ceiling gc-info-length 8)))
-         (address (allocate total-size *default-pinned-allocation-area*)))
-    ;; Read mc bytes.
-    (read-sequence mc stream :start 16 :end (+ 16 mc-length))
-    ;; Copy machine code bytes.
-    (dotimes (i (ceiling (+ mc-length 16) 8))
-      (setf (word (+ address i)) (nibbles:ub64ref/le mc (* i 8)))
-      #+nil(when (not (member i '(0 1)))
-        (lock-word (+ address i))))
-    ;; Read GC bytes.
-    (read-sequence gc-info stream :end gc-info-length)
-    ;; Copy GC bytes.
-    (dotimes (i (ceiling gc-info-length 8))
-      (setf (word (+ address
-                     (* (ceiling (+ mc-length 16) 16) 2)
-                     n-constants
-                     i))
-            (nibbles:ub64ref/le gc-info (* i 8)))
-      (lock-word (+ address
-                    (* (ceiling (+ mc-length 16) 16) 2)
-                    n-constants
-                    i)))
-    ;; Set function header.
-    (setf (word address) 0)
-    (setf (word (1+ address)) (* (+ address 2) 8))
-    (lock-word (1+ address))
-    (setf (ldb (byte  8 0) (word address)) (ash tag sys.int::+object-type-shift+)
-          (ldb (byte 16 16) (word address)) (ceiling (+ mc-length 16) 16)
-          (ldb (byte 16 32) (word address)) n-constants
-          (ldb (byte 16 48) (word address)) gc-info-length)
-    (lock-word address)
-    ;; Set constant pool.
-    (dotimes (i (length constants))
-      (setf (word (+ address (* (ceiling (+ mc-length 16) 16) 2) i))
-            (elt constants i))
-      (lock-word (+ address (* (ceiling (+ mc-length 16) 16) 2) i)))
-    ;; Add to the function map.
-    (push (list address (extract-object (elt constants 0)))
-          *function-map*)
-    ;; Add fixups to the list.
-    (dolist (fixup (extract-object fixups))
-      (assert (>= (cdr fixup) 16))
-      (push (list (car fixup) address (cdr fixup) :signed32 (elt constants 1))
-            *pending-fixups*))
-    ;; Done.
-    (make-value address sys.int::+tag-object+)))
-
-(defun load-llf-vector (stream stack)
-  (let* ((len (load-integer stream))
-         (address (allocate (1+ len))))
-    ;; Header word.
-    (setf (word address) (array-header sys.int::+object-tag-array-t+ len))
-    ;; Drop vector values and copy them into the image.
-    (decf (fill-pointer stack) len)
-    (dotimes (i len)
-      (setf (word (+ address 1 i)) (aref stack (+ (length stack) i))))
-    (make-value address sys.int::+tag-object+)))
+(defun function-header (code-length pool-length metadata-length &optional (tag sys.int::+object-tag-function+))
+  (assert (< (ceiling (+ code-length 16) 16) (expt 2 (cross-cl:byte-size sys.int::+function-header-code-size+))))
+  (assert (< pool-length (expt 2 (cross-cl:byte-size sys.int::+function-header-pool-size+))))
+  (assert (< metadata-length (expt 2 (cross-cl:byte-size sys.int::+function-header-metadata-size+))))
+  (array-header tag
+                (logior (cross-cl:dpb (ceiling (+ code-length 16) 16) sys.int::+function-header-code-size+ 0)
+                        (cross-cl:dpb pool-length sys.int::+function-header-pool-size+ 0)
+                        (cross-cl:dpb metadata-length sys.int::+function-header-metadata-size+ 0))))
 
 (defun generate-fref-name (name)
   "Turn a Lisp name into an address."
@@ -1739,264 +1696,6 @@ Tag with +TAG-OBJECT+."
                                         (package-name (symbol-package name)))))
           (setf (word (+ sym-addr 4)) (make-value fref sys.int::+tag-object+)))))
     fref))
-
-(defun load-structure-slot-definition (name accessor initform type read-only)
-  (let ((image-def (vmake-struct-slot-def name accessor initform type read-only))
-        (cross-def (sys.int::make-struct-slot-definition name accessor initform type read-only)))
-    (setf (gethash image-def *image-to-cross-slot-definitions*) cross-def)
-    image-def))
-
-(defun maybe-eval-funcall-n (name name-value args-values)
-  (cond ((and *load-should-set-fdefinitions*
-              (eql name 'sys.int::%defun)
-              (eql (length args-values) 2)
-              (cross-value-p (elt args-values 0))
-              (cross-value-p (elt args-values 1)))
-         (let* ((defun-name-value (second (elt args-values 0)))
-                (fn-value (second (elt args-values 1)))
-                (defun-name (extract-object defun-name-value))
-                (fref (function-reference defun-name)))
-           (setf (word (+ fref 2)) fn-value
-                 (word (+ fref 3)) (word (1+ (pointer-part fn-value)))))
-         name-value)
-        (t
-         nil)))
-
-(defun load-one-object (command stream stack)
-  (ecase command
-    (#.sys.int::+llf-function+
-     (load-llf-function stream stack))
-    (#.sys.int::+llf-cons+
-     (let* ((car (stack-pop stack))
-            (cdr (stack-pop stack)))
-       (vcons car cdr)))
-    (#.sys.int::+llf-symbol+
-     (let* ((name (load-string* stream))
-            (package (load-string* stream)))
-       (make-value (symbol-address name package)
-                   sys.int::+tag-object+)))
-    (#.sys.int::+llf-uninterned-symbol+
-     (let ((plist (stack-pop stack))
-           (fn (stack-pop stack))
-           (value (stack-pop stack))
-           (name (stack-pop stack))
-           (address (allocate 8 :wired))
-           (global-cell (allocate 4 :wired)))
-       ;; FN and VALUE may be the unbound tag.
-       (setf (word (+ address 0)) (array-header sys.int::+object-tag-symbol+ 0)
-             (word (+ address 1)) name
-             (word (+ address 2)) (make-value (symbol-address "NIL" "COMMON-LISP") sys.int::+tag-object+)
-             (word (+ address 3)) (make-value global-cell sys.int::+tag-object+)
-             (word (+ address 4)) (make-value (symbol-address "NIL" "COMMON-LISP") sys.int::+tag-object+)
-             (word (+ address 5)) plist
-             (word (+ address 6)) (vsym t))
-       (setf (word (+ global-cell 0)) (array-header sys.int::+object-tag-array-t+ 3)
-             (word (+ global-cell 1)) (vsym nil)
-             (word (+ global-cell 2)) (make-value address sys.int::+tag-object+)
-             (word (+ global-cell 3)) value)
-       (unless (eql fn (unbound-value))
-         (error "Uninterned symbol with function not supported."))
-       (make-value address sys.int::+tag-object+)))
-    (#.sys.int::+llf-unbound+ (unbound-value))
-    (#.sys.int::+llf-string+ (load-string stream))
-    (#.sys.int::+llf-integer+
-     (let ((value (load-integer stream)))
-       (typecase value
-         ((signed-byte 63) (make-fixnum value))
-         (t (make-bignum value)))))
-    (#.sys.int::+llf-simple-vector+
-     (load-llf-vector stream stack))
-    (#.sys.int::+llf-character+
-     (logior (ash (load-character stream) 4)
-             sys.int::+tag-character+))
-    (#.sys.int::+llf-structure-definition+
-     (let ((area (stack-pop stack))
-           (parent (stack-pop stack))
-           (slots (stack-pop stack))
-           (name (stack-pop stack)))
-       (load-structure-definition name slots parent area)))
-    (#.sys.int::+llf-structure-slot-definition+
-     (let ((read-only (stack-pop stack))
-           (type (stack-pop stack))
-           (initform (stack-pop stack))
-           (accessor (stack-pop stack))
-           (name (stack-pop stack)))
-       (load-structure-slot-definition name accessor initform type read-only)))
-    (#.sys.int::+llf-single-float+
-     (logior (ash (load-integer stream) 32)
-             sys.int::+tag-single-float+))
-    (#.sys.int::+llf-double-float+
-     (let* ((bits (load-integer stream))
-            (address (allocate 2)))
-       (setf (word address) (array-header sys.int::+object-tag-double-float+ 0)
-             (word (1+ address)) bits)
-       (make-value address sys.int::+tag-object+)))
-    (#.sys.int::+llf-proper-list+
-     (let ((list (make-value (symbol-address "NIL" "COMMON-LISP") sys.int::+tag-object+))
-           (length (load-integer stream)))
-       (dotimes (i length)
-         (setf list (vcons (stack-pop stack) list)))
-       list))
-    (#.sys.int::+llf-integer-vector+
-     (let* ((len (load-integer stream))
-            (address (allocate (1+ len))))
-       ;; Header word.
-       (setf (word address) (array-header sys.int::+object-tag-array-t+ len))
-       (dotimes (i len)
-         (let ((value (load-integer stream)))
-           (setf (word (+ address 1 i)) (typecase value
-                                          ((signed-byte 63) (make-fixnum value))
-                                          (t (make-bignum value))))))
-       (make-value address sys.int::+tag-object+)))
-    (#.sys.int::+llf-bit-vector+
-     (let* ((len (load-integer stream))
-            (address (allocate (1+ (ceiling len 64)))))
-       ;; Header word.
-       (setf (word address) (array-header sys.int::+object-tag-array-bit+ len))
-       (dotimes (i (ceiling len 8))
-         (let ((octet (read-byte stream)))
-           (multiple-value-bind (word offset)
-               (truncate i 8)
-             (setf (ldb (byte 8 (* offset 8))
-                        (word (+ address 1 word)))
-                   octet))))
-       (make-value address sys.int::+tag-object+)))
-    (#.sys.int::+llf-function-reference+
-     (let* ((name (stack-pop stack))
-            (truname (extract-object name)))
-       (make-value (function-reference truname)
-                   sys.int::+tag-object+)))
-    (#.sys.int::+llf-byte+
-     (let ((size (load-integer stream))
-           (position (load-integer stream)))
-       (logior (ash size 4)
-               (ash position 18)
-               sys.int::+tag-byte-specifier+)))
-    (#.sys.int::+llf-funcall-n+
-     (let* ((n-args-value (stack-pop stack))
-            (n-args (extract-object n-args-value))
-            (fn-name-value (stack-pop stack))
-            (fn-name (and (not (value-is-function-p fn-name-value))
-                          (extract-object fn-name-value)))
-            (args-values (reverse (loop
-                                     repeat n-args
-                                     collect (stack-pop stack :lazy))))
-            (value (and fn-name
-                        (maybe-eval-funcall-n fn-name fn-name-value args-values))))
-       (cond (value)
-             (t
-              ;; Not able to evaluate the function.
-              (list
-               `(funcall ,(if (value-is-function-p fn-name-value)
-                              `(:cross-value ,fn-name-value)
-                              `#'(:cross-value ,fn-name-value))
-                         ,@(loop
-                              for arg in args-values
-                              collect (if (cross-value-p arg)
-                                          `',arg
-                                          arg))))))))
-    (#.sys.int::+llf-drop+
-     (stack-pop stack :load)
-     nil)
-    (#.sys.int::+llf-complex-rational+
-     (let* ((realpart-numerator (load-integer stream))
-            (realpart-denominator (load-integer stream))
-            (imagpart-numerator (load-integer stream))
-            (imagpart-denominator (load-integer stream))
-            (address (allocate 4)))
-       ;; TODO: Support ratios.
-       (assert (eql realpart-denominator 1))
-       (assert (eql imagpart-denominator 1))
-       ;; Header word.
-       (setf (word address) (ash sys.int::+object-tag-complex-rational+
-                                 sys.int::+object-type-shift+))
-       (setf (word (+ address 1)) (typecase realpart-numerator
-                                    ((signed-byte 63) (make-fixnum realpart-numerator))
-                                    (t (make-bignum realpart-numerator)))
-             (word (+ address 2)) (typecase imagpart-numerator
-                                    ((signed-byte 63) (make-fixnum imagpart-numerator))
-                                    (t (make-bignum imagpart-numerator))))
-       (make-value address sys.int::+tag-object+)))
-    (#.sys.int::+llf-complex-single-float+
-     (let* ((realpart (load-integer stream))
-            (imagpart (load-integer stream))
-            (address (allocate 2)))
-       ;; Header word.
-       (setf (word address) (ash sys.int::+object-tag-complex-single-float+
-                                 sys.int::+object-type-shift+))
-       (setf (word (+ address 1)) (logior realpart
-                                          (ash imagpart 32)))
-       (make-value address sys.int::+tag-object+)))
-    (#.sys.int::+llf-complex-double-float+
-     (let* ((realpart (load-integer stream))
-            (imagpart (load-integer stream))
-            (address (allocate 4)))
-       ;; Header word.
-       (setf (word address) (ash sys.int::+object-tag-complex-double-float+
-                                 sys.int::+object-type-shift+))
-       (setf (word (+ address 1)) realpart
-             (word (+ address 2)) imagpart)
-       (make-value address sys.int::+tag-object+)))))
-
-(defun load-llf (stream)
-  (let ((omap (make-hash-table))
-        (stack (make-array 64 :adjustable t :fill-pointer 0)))
-    (loop (let ((command (read-byte stream)))
-            (case command
-              (#.sys.int::+llf-end-of-load+
-               (return))
-              (#.sys.int::+llf-backlink+
-               (let ((id (load-integer stream)))
-                 (multiple-value-bind (value value-p)
-                     (gethash id omap)
-                   (unless value-p
-                     (error "Unknown backlink ID ~D." id))
-                   (vector-push-extend value stack))))
-              (#.sys.int::+llf-add-backlink+
-               (let ((id (load-integer stream)))
-                 (multiple-value-bind (existing-value existing-value-p)
-                     (gethash id omap)
-                   (declare (ignore existing-value))
-                   (when existing-value-p
-                     (error "Duplicate backlink ID ~D." id)))
-                 (setf (gethash id omap) (stack-pop stack))))
-              (t (let ((value (load-one-object command stream stack)))
-                   (when value
-                     (vector-push-extend value stack)))))))))
-
-(defun load-source-file (file set-fdefinitions &optional wired)
-  (let ((llf-path (merge-pathnames (make-pathname :type "llf" :defaults file)))
-        (*load-should-set-fdefinitions* set-fdefinitions)
-        (*default-general-allocation-area* (if wired :wired :general))
-        (*default-cons-allocation-area* (if wired :wired :cons))
-        (*default-pinned-allocation-area* (if wired :wired :pinned)))
-    (when (and (not (string-equal (pathname-type (pathname file)) "llf"))
-               (or (not (probe-file llf-path))
-                   (<= (file-write-date llf-path) (file-write-date file))))
-      (format t "~A is out of date will be recompiled.~%" llf-path)
-      (sys.c::cross-compile-file file))
-    (format t ";; Loading ~S.~%" llf-path)
-    (with-open-file (s llf-path :element-type '(unsigned-byte 8))
-      ;; Check the header.
-      (assert (and (eql (read-byte s) #x4C)
-                   (eql (read-byte s) #x4C)
-                   (eql (read-byte s) #x46)
-                   (eql (read-byte s) #x01))
-              ()
-              "Bad LLF magic. Probably old-style LLF, please remove and rebuild.")
-      (let ((version (load-integer s)))
-        (assert (eql version sys.int::*llf-version*)
-                ()
-                "Bad LLF version ~D, wanted version ~D." version sys.int::*llf-version*))
-      (let ((arch (case (load-integer s)
-                    (#.sys.int::+llf-arch-x86-64+ :x86-64)
-                    (#.sys.int::+llf-arch-arm64+ :arm64)
-                    (t :unknown))))
-        (assert (eql arch sys.c::*target-architecture*) ()
-                "LLF compiled for wrong architecture ~S. Wanted ~S."
-                arch sys.c::*target-architecture*))
-      ;; Read forms.
-      (load-llf s))))
 
 (defun apply-fixups (fixups)
   (mapc 'apply-fixup fixups))
@@ -2051,6 +1750,7 @@ Tag with +TAG-OBJECT+."
     "system/sequence.lisp"
     "system/hash-table.lisp"
     "system/packages.lisp"
+    "system/gray-streams.lisp"
     "system/stream.lisp"
     "system/reader.lisp"
     "system/printer.lisp"

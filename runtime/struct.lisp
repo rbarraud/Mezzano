@@ -8,6 +8,8 @@
 (sys.int::defglobal sys.int::*structure-type-type* nil)
 (sys.int::defglobal sys.int::*structure-slot-type* nil)
 
+(sys.int::defglobal *structure-types*)
+
 (declaim (inline sys.int::structure-object-p
                  sys.int::%struct-slot
                  (setf sys.int::%struct-slot)
@@ -62,7 +64,8 @@
     x))
 
 (defun sys.int::structure-definition-p (object)
-  (eq (sys.int::%struct-slot object 0) sys.int::*structure-type-type*))
+  (and (sys.int::structure-object-p object)
+       (eq (sys.int::%struct-slot object 0) sys.int::*structure-type-type*)))
 
 (macrolet ((def (name field)
              `(defun ,name (object)
@@ -93,7 +96,8 @@
     x))
 
 (defun sys.int::structure-slot-definition-p (object)
-  (eq (sys.int::%struct-slot object 0) sys.int::*structure-slot-type*))
+  (and (sys.int::structure-object-p object)
+       (eq (sys.int::%struct-slot object 0) sys.int::*structure-slot-type*)))
 
 (macrolet ((def (name field)
              `(defun ,name (object)

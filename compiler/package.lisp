@@ -16,6 +16,10 @@
            #:constantp
            #:fixnump
 
+           #:target
+           #:x86-64-target
+           #:arm64-target
+
            #:quoted-form-p
            #:lambda-information
            #:lambda-information-p
@@ -97,7 +101,10 @@
            #:ast-protected-form
            #:ast-cleanup-function
            #:ast-arguments
-           #:ast-targets)
+           #:ast-targets
+
+           #:with-metering
+           #:reset-meters)
   (:use :cl))
 
 (defpackage :mezzano.compiler.codegen.x86-64
@@ -107,8 +114,7 @@
 
 (defpackage :mezzano.lap.arm64
   (:documentation "arm64 assembler for LAP.")
-  (:use :cl)
-  (:export #:assemble))
+  (:use :cl))
 
 (defpackage :mezzano.compiler.codegen.arm64
   (:use :cl :mezzano.compiler)
@@ -223,6 +229,7 @@
            #:allocate-memory-range
            #:protect-memory-range
            #:release-memory-range
+           #:update-wired-dirty-bits
            #:debug-print-line
            #:panic
            #:fifo
@@ -256,6 +263,7 @@
            #:disk-sector-size
            #:disk-read
            #:disk-write
+           #:disk-name
            #:make-disk-request
            #:disk-submit-request
            #:disk-cancel-request
@@ -370,15 +378,294 @@
 (defpackage :sys.lap
   (:documentation "The system assembler.")
   (:use :cl)
-  (:export #:perform-assembly
+  (:export #:perform-assembly-using-target
+           #:perform-assembly
            #:emit
+           #:emit-relocation
            #:immediatep
            #:resolve-immediate
            #:*current-address*
            #:note-fixup
-           #:*function-reference-resolver*))
+           #:note-variably-sized-instruction
+           #:*function-reference-resolver*
+           #:label
+           #:make-label
+           #:label-name))
 
 (defpackage :sys.lap-x86
   (:documentation "x86 assembler for LAP.")
-  (:use :cl :sys.lap)
-  (:export #:assemble))
+  (:use :cl :sys.lap))
+
+(defpackage :mezzano.compiler.backend
+  (:use :cl :mezzano.compiler)
+  (:export #:virtual-register
+           #:virtual-register-kind
+           #:backend-function
+           #:backend-function-name
+
+           #:first-instruction
+           #:last-instruction
+           #:next-instruction
+           #:prev-instruction
+           #:insert-before
+           #:insert-after
+           #:append-instruction
+           #:remove-instruction
+
+           #:do-instructions
+           #:do-reversed-instructions
+
+           #:backend-instruction
+           #:terminator-instruction
+
+           #:print-instruction
+           #:instruction-inputs
+           #:instruction-outputs
+           #:produces-multiple-p
+           #:consumes-multiple-p
+           #:instruction-pure-p
+           #:successors
+           #:replace-all-registers
+
+           #:label
+           #:label-name
+           #:label-phis
+
+           #:argument-setup-instruction
+           #:argument-setup-fref
+           #:argument-setup-closure
+           #:argument-setup-count
+           #:argument-setup-required
+           #:argument-setup-optional
+           #:argument-setup-rest
+
+           #:bind-local-instruction
+           #:bind-local-ast
+           #:bind-local-value
+
+           #:unbind-local-instruction
+           #:unbind-local-local
+
+           #:load-local-instruction
+           #:load-local-destination
+           #:load-local-local
+
+           #:store-local-instruction
+           #:store-local-value
+           #:store-local-local
+
+           #:move-instruction
+           #:move-destination
+           #:move-source
+
+           #:swap-instruction
+           #:swap-lhs
+           #:swap-rhs
+
+           #:spill-instruction
+           #:spill-destination
+           #:spill-source
+
+           #:fill-instruction
+           #:fill-destination
+           #:fill-source
+
+           #:constant-instruction
+           #:constant-destination
+           #:constant-value
+
+           #:values-instruction
+           #:values-values
+
+           #:multiple-value-bind-instruction
+           #:multiple-value-bind-values
+
+           #:save-multiple-instruction
+           #:restore-multiple-instruction
+           #:restore-multiple-context
+           #:forget-multiple-instruction
+           #:forget-multiple-context
+
+           #:jump-instruction
+           #:jump-target
+
+           #:branch-instruction
+           #:branch-value
+           #:branch-true-target
+           #:branch-false-target
+
+           #:switch-instruction
+           #:switch-value
+           #:switch-targets
+
+           #:call-instruction
+           #:call-multiple-instruction
+           #:tail-call-instruction
+           #:funcall-instruction
+           #:funcall-multiple-instruction
+           #:tail-funcall-instruction
+           #:multiple-value-funcall-instruction
+           #:multiple-value-funcall-multiple-instruction
+           #:call-result
+           #:call-function
+           #:call-arguments
+
+           #:return-instruction
+           #:return-value
+           #:return-multiple-instruction
+
+           #:unreachable-instruction
+
+           #:nlx-region
+           #:nlx-context
+           #:begin-nlx-instruction
+           #:begin-nlx-targets
+           #:finish-nlx-instruction
+           #:invoke-nlx-instruction
+           #:invoke-nlx-multiple-instruction
+           #:invoke-nlx-index
+           #:invoke-nlx-value
+           #:nlx-entry-instruction
+           #:nlx-entry-multiple-instruction
+           #:nlx-entry-value
+
+           #:push-special-stack-instruction
+           #:push-special-stack-a-value
+           #:push-special-stack-b-value
+           #:push-special-stack-frame
+
+           #:flush-binding-cache-entry-instruction
+           #:flush-binding-cache-entry-symbol
+           #:flush-binding-cache-entry-new-value
+
+           #:unbind-instruction
+           #:disestablish-block-or-tagbody-instruction
+           #:disestablish-unwind-protect-instruction
+
+           #:make-dx-simple-vector-instruction
+           #:make-dx-simple-vector-result
+           #:make-dx-simple-vector-size
+
+           #:make-dx-cons-instruction
+           #:make-dx-cons-result
+
+           #:make-dx-closure-instruction
+           #:make-dx-closure-result
+           #:make-dx-closure-function
+           #:make-dx-closure-environment
+
+           #:box-type
+           #:box-instruction
+           #:box-destination
+           #:box-source
+           #:box-fixnum-instruction
+           #:box-unsigned-byte-64-instruction
+           #:box-signed-byte-64-instruction
+           #:box-single-float-instruction
+           #:box-double-float-instruction
+
+           #:unbox-instruction
+           #:unbox-destination
+           #:unbox-source
+           #:unbox-fixnum-instruction
+           #:unbox-unsigned-byte-64-instruction
+           #:unbox-signed-byte-64-instruction
+           #:unbox-single-float-instruction
+           #:unbox-double-float-instruction
+
+           #:debug-instruction
+           #:debug-bind-variable-instruction
+           #:debug-unbind-variable-instruction
+           #:debug-update-variable-instruction
+           #:debug-variable
+           #:debug-value
+
+           #:compile-backend-function
+
+           #:perform-target-lowering
+           #:perform-target-lowering-post-ssa
+           #:perform-target-lap-generation
+))
+
+(defpackage :mezzano.compiler.backend.dominance
+  (:use :cl :mezzano.compiler.backend)
+  (:export #:compute-dominance
+           #:dominatep
+           #:dominator-tree-parent
+           #:dominator-tree-children
+           #:dominance-frontier))
+
+(defpackage :mezzano.compiler.backend.ast-convert
+  (:use :cl :mezzano.compiler :mezzano.compiler.backend)
+  (:export #:convert))
+
+(defpackage :mezzano.compiler.backend.register-allocator
+  (:use :cl)
+  (:local-nicknames (:ir :mezzano.compiler.backend))
+  (:export #:target-argument-registers
+           #:target-return-register
+           #:target-funcall-register
+           #:target-fref-register
+           #:target-count-register
+           #:architectural-physical-registers
+           #:valid-physical-registers-for-kind
+           #:spill/fill-register-kinds-compatible
+           #:instruction-clobbers
+           #:instruction-inputs-read-before-outputs-written-p
+           #:allow-memory-operand-p))
+
+(defpackage :mezzano.compiler.backend.x86-64
+  (:use :cl)
+  (:local-nicknames (:lap :sys.lap-x86)
+                    (:ir :mezzano.compiler.backend)
+                    (:ra :mezzano.compiler.backend.register-allocator)))
+
+(defpackage :mezzano.compiler.backend.arm64
+  (:use :cl)
+  (:local-nicknames (:lap :mezzano.lap.arm64)
+                    (:ir :mezzano.compiler.backend)
+                    (:ra :mezzano.compiler.backend.register-allocator)))
+
+(defpackage :mezzano.simd
+  (:use :cl)
+  (:export #:make-mmx-vector
+           #:mmx-vector-value
+           #:mmx-vector
+           #:mmx-vector-p
+           #:make-sse-vector
+           #:sse-vector-value
+           #:make-sse-vector-single-float
+           #:sse-vector-single-float-element
+           #:sse-vector-single-float-1-ref
+           #:sse-vector-single-float-2-ref
+           #:sse-vector-single-float-4-ref
+           #:make-sse-vector-double-float
+           #:sse-vector-double-float-element
+           #:sse-vector-double-float-1-ref
+           #:sse-vector-double-float-2-ref
+           #:sse-vector
+           #:sse-vector-p))
+
+(defpackage :mezzano.delimited-continuations
+  (:use :cl)
+  (:export #:delimited-continuation-p
+           #:delimited-continuation
+           #:make-prompt-tag
+           #:prompt-tag
+           #:prompt-tag-p
+           #:*default-continuation-stack-size*
+           #:call-with-prompt
+           #:abort-to-prompt
+           #:resumable-p
+           #:call-with-continuation-barrier
+           #:with-continuation-barrier
+           #:suspendable-continuation-p
+           #:consumed-continuation-resumed
+           #:consumed-continuation-resumed-continuation
+           #:consumed-continuation-resumed-arguments
+           #:barrier-present
+           #:barrier-present-tag
+           #:barrier-present-barrier
+           #:unknown-prompt-tag
+           #:unknown-prompt-tag-tag)
+  (:local-nicknames (:lap :sys.lap-x86)))

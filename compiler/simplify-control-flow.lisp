@@ -7,8 +7,10 @@
 
 (defvar *tagbody-statement-stack* '())
 
-(defun simplify-control-flow (form)
-  (simplify-control-flow-1 form '() '() '() nil))
+(defun simplify-control-flow (form architecture)
+  (declare (ignore architecture))
+  (with-metering (:simplify-control-flow)
+    (simplify-control-flow-1 form '() '() '() nil)))
 
 (defun simplify-control-flow-get-replacement-go-tag (go-tag renames)
   (let ((new (assoc go-tag renames)))

@@ -21,19 +21,116 @@
     (lambda :in mezzano.clos::compute-n-effective-discriminator)
     (lambda :in mezzano.clos::std-compute-effective-method-function-with-standard-method-combination)
     (lambda :in mezzano.clos::compute-primary-emfun)
-    (mezzano.clos::1-effective-discriminator 0 1 nil)
-    (mezzano.clos::1-effective-discriminator 0 1 t)
-    (mezzano.clos::1-effective-discriminator 0 2 nil)
-    (mezzano.clos::1-effective-discriminator 0 2 t)
-    (mezzano.clos::1-effective-discriminator 0 3 nil)
-    (mezzano.clos::1-effective-discriminator 0 3 t)
-    (mezzano.clos::1-effective-discriminator 0 4 nil)
-    (mezzano.clos::1-effective-discriminator 0 4 t)
-    (mezzano.clos::1-effective-discriminator 0 5 nil)
-    (mezzano.clos::1-effective-discriminator 0 5 t)
+    (mezzano.clos::1-effective-discriminator 0 1 nil nil)
+    (mezzano.clos::1-effective-discriminator 0 1 t nil)
+    (mezzano.clos::1-effective-discriminator 0 2 nil nil)
+    (mezzano.clos::1-effective-discriminator 0 2 t nil)
+    (mezzano.clos::1-effective-discriminator 0 3 nil nil)
+    (mezzano.clos::1-effective-discriminator 0 3 t nil)
+    (mezzano.clos::1-effective-discriminator 0 4 nil nil)
+    (mezzano.clos::1-effective-discriminator 0 4 t nil)
+    (mezzano.clos::1-effective-discriminator 0 5 nil nil)
+    (mezzano.clos::1-effective-discriminator 0 5 t nil)
+    (mezzano.clos::1-effective-discriminator 1 1 nil nil)
+    (mezzano.clos::1-effective-discriminator 1 1 t nil)
+    (mezzano.clos::1-effective-discriminator 1 2 nil nil)
+    (mezzano.clos::1-effective-discriminator 1 2 t nil)
+    (mezzano.clos::1-effective-discriminator 1 3 nil nil)
+    (mezzano.clos::1-effective-discriminator 1 3 t nil)
+    (mezzano.clos::1-effective-discriminator 1 4 nil nil)
+    (mezzano.clos::1-effective-discriminator 1 4 t nil)
+    (mezzano.clos::1-effective-discriminator 1 5 nil nil)
+    (mezzano.clos::1-effective-discriminator 1 5 t nil)
+    (mezzano.clos::1-effective-discriminator 2 1 nil nil)
+    (mezzano.clos::1-effective-discriminator 2 1 t nil)
+    (mezzano.clos::1-effective-discriminator 2 2 nil nil)
+    (mezzano.clos::1-effective-discriminator 2 2 t nil)
+    (mezzano.clos::1-effective-discriminator 2 3 nil nil)
+    (mezzano.clos::1-effective-discriminator 2 3 t nil)
+    (mezzano.clos::1-effective-discriminator 2 4 nil nil)
+    (mezzano.clos::1-effective-discriminator 2 4 t nil)
+    (mezzano.clos::1-effective-discriminator 2 5 nil nil)
+    (mezzano.clos::1-effective-discriminator 2 5 t nil)
+    (mezzano.clos::1-effective-discriminator 3 1 nil nil)
+    (mezzano.clos::1-effective-discriminator 3 1 t nil)
+    (mezzano.clos::1-effective-discriminator 3 2 nil nil)
+    (mezzano.clos::1-effective-discriminator 3 2 t nil)
+    (mezzano.clos::1-effective-discriminator 3 3 nil nil)
+    (mezzano.clos::1-effective-discriminator 3 3 t nil)
+    (mezzano.clos::1-effective-discriminator 3 4 nil nil)
+    (mezzano.clos::1-effective-discriminator 3 4 t nil)
+    (mezzano.clos::1-effective-discriminator 3 5 nil nil)
+    (mezzano.clos::1-effective-discriminator 3 5 t nil)
+    (mezzano.clos::1-effective-discriminator 4 1 nil nil)
+    (mezzano.clos::1-effective-discriminator 4 1 t nil)
+    (mezzano.clos::1-effective-discriminator 4 2 nil nil)
+    (mezzano.clos::1-effective-discriminator 4 2 t nil)
+    (mezzano.clos::1-effective-discriminator 4 3 nil nil)
+    (mezzano.clos::1-effective-discriminator 4 3 t nil)
+    (mezzano.clos::1-effective-discriminator 4 4 nil nil)
+    (mezzano.clos::1-effective-discriminator 4 4 t nil)
+    (mezzano.clos::1-effective-discriminator 4 5 nil nil)
+    (mezzano.clos::1-effective-discriminator 4 5 t nil)
+    (mezzano.clos::1-effective-discriminator 0 1 nil t)
+    (mezzano.clos::1-effective-discriminator 0 1 t t)
+    (mezzano.clos::1-effective-discriminator 0 2 nil t)
+    (mezzano.clos::1-effective-discriminator 0 2 t t)
+    (mezzano.clos::1-effective-discriminator 0 3 nil t)
+    (mezzano.clos::1-effective-discriminator 0 3 t t)
+    (mezzano.clos::1-effective-discriminator 0 4 nil t)
+    (mezzano.clos::1-effective-discriminator 0 4 t t)
+    (mezzano.clos::1-effective-discriminator 0 5 nil t)
+    (mezzano.clos::1-effective-discriminator 0 5 t t)
+    (mezzano.clos::1-effective-discriminator 1 1 nil t)
+    (mezzano.clos::1-effective-discriminator 1 1 t t)
+    (mezzano.clos::1-effective-discriminator 1 2 nil t)
+    (mezzano.clos::1-effective-discriminator 1 2 t t)
+    (mezzano.clos::1-effective-discriminator 1 3 nil t)
+    (mezzano.clos::1-effective-discriminator 1 3 t t)
+    (mezzano.clos::1-effective-discriminator 1 4 nil t)
+    (mezzano.clos::1-effective-discriminator 1 4 t t)
+    (mezzano.clos::1-effective-discriminator 1 5 nil t)
+    (mezzano.clos::1-effective-discriminator 1 5 t t)
+    (mezzano.clos::1-effective-discriminator 2 1 nil t)
+    (mezzano.clos::1-effective-discriminator 2 1 t t)
+    (mezzano.clos::1-effective-discriminator 2 2 nil t)
+    (mezzano.clos::1-effective-discriminator 2 2 t t)
+    (mezzano.clos::1-effective-discriminator 2 3 nil t)
+    (mezzano.clos::1-effective-discriminator 2 3 t t)
+    (mezzano.clos::1-effective-discriminator 2 4 nil t)
+    (mezzano.clos::1-effective-discriminator 2 4 t t)
+    (mezzano.clos::1-effective-discriminator 2 5 nil t)
+    (mezzano.clos::1-effective-discriminator 2 5 t t)
+    (mezzano.clos::1-effective-discriminator 3 1 nil t)
+    (mezzano.clos::1-effective-discriminator 3 1 t t)
+    (mezzano.clos::1-effective-discriminator 3 2 nil t)
+    (mezzano.clos::1-effective-discriminator 3 2 t t)
+    (mezzano.clos::1-effective-discriminator 3 3 nil t)
+    (mezzano.clos::1-effective-discriminator 3 3 t t)
+    (mezzano.clos::1-effective-discriminator 3 4 nil t)
+    (mezzano.clos::1-effective-discriminator 3 4 t t)
+    (mezzano.clos::1-effective-discriminator 3 5 nil t)
+    (mezzano.clos::1-effective-discriminator 3 5 t t)
+    (mezzano.clos::1-effective-discriminator 4 1 nil t)
+    (mezzano.clos::1-effective-discriminator 4 1 t t)
+    (mezzano.clos::1-effective-discriminator 4 2 nil t)
+    (mezzano.clos::1-effective-discriminator 4 2 t t)
+    (mezzano.clos::1-effective-discriminator 4 3 nil t)
+    (mezzano.clos::1-effective-discriminator 4 3 t t)
+    (mezzano.clos::1-effective-discriminator 4 4 nil t)
+    (mezzano.clos::1-effective-discriminator 4 4 t t)
+    (mezzano.clos::1-effective-discriminator 4 5 nil t)
+    (mezzano.clos::1-effective-discriminator 4 5 t t)
     sys.int::%progv
     sys.int::%catch
-    mezzano.supervisor::call-with-snapshot-inhibited))
+    mezzano.supervisor::call-with-snapshot-inhibited
+    mezzano.compiler::call-with-metering
+    mezzano.supervisor::call-with-mutex
+    sys.int::%%closure-trampoline
+    sys.int::%%funcallable-instance-trampoline))
+
+(defclass profile-data ()
+  ((%data :initarg :data :reader profile-data)))
 
 (defstruct thread-sample
   thread
@@ -55,23 +152,51 @@
 
 (defun call-with-profiling (function &key buffer-size path (thread t) (verbosity :report) (prune (eql thread 't)) (ignore-functions *ignorable-function-names*) repeat order-by)
   (let* ((profile-buffer nil)
-         (results (unwind-protect
-                       (progn
-                         (mezzano.supervisor:start-profiling
-                          :buffer-size buffer-size
-                          :thread (if (eq thread t)
-                                      (mezzano.supervisor:current-thread)
-                                      thread))
-                         (if repeat
-                             (dotimes (i repeat)
-                               (funcall function))
-                             (multiple-value-list (funcall function))))
-                    (setf profile-buffer (mezzano.supervisor:stop-profiling)))))
-    (setf profile-buffer (decode-profile-buffer profile-buffer (if prune #'call-with-profiling nil) ignore-functions))
-    (cond (path
-           (save-profile path profile-buffer :verbosity verbosity :order-by order-by)
-           (values-list results))
-          (t profile-buffer))))
+         (results (cond (repeat
+                         (let ((profiles '()))
+                           (dotimes (i repeat)
+                             ;; The buffer is fixed size and can only be so large due to wired
+                             ;; area limits. Restart the profiler each run and combine the
+                             ;; results after the fact to make better use of it.
+                             (unwind-protect
+                                  (progn
+                                    (mezzano.supervisor:start-profiling
+                                     :buffer-size buffer-size
+                                     :thread (if (eq thread t)
+                                                 (mezzano.supervisor:current-thread)
+                                                 thread)
+                                     ;; Disable sampling during GC when tracing a specific thread.
+                                     :sample-during-gc (not thread))
+                                    (funcall function))
+                               (push (decode-profile-buffer (mezzano.supervisor:stop-profiling)
+                                                            (if prune #'call-with-profiling nil)
+                                                            ignore-functions)
+                                     profiles)))
+                           (setf profile-buffer (reduce #'(lambda (x y) (concatenate 'vector x y))
+                                                        (reverse profiles)
+                                                        :initial-value #()))
+                           '()))
+                        (t
+                         (multiple-value-list
+                          (unwind-protect
+                               (progn
+                                 (mezzano.supervisor:start-profiling
+                                  :buffer-size buffer-size
+                                  :thread (if (eq thread t)
+                                              (mezzano.supervisor:current-thread)
+                                              thread)
+                                  ;; Disable sampling during GC when tracing a specific thread.
+                                  :sample-during-gc (not thread))
+                                 (funcall function))
+                            (setf profile-buffer (decode-profile-buffer (mezzano.supervisor:stop-profiling)
+                                                                        (if prune #'call-with-profiling nil)
+                                                                        ignore-functions))))))))
+    (let ((data (make-instance 'profile-data :data profile-buffer)))
+      (cond (path
+             (save-profile path data :verbosity verbosity :order-by order-by)
+             (values-list results))
+            (t
+             data)))))
 
 (defun decode-profile-buffer (buffer &optional prune-function ignore-functions)
   "Convert the buffer returned by STOP-PROFILING into a more useful format.
@@ -99,6 +224,7 @@ thread states & call-stacks."
          (when (>= offset (length buffer))
            (return))
          (incf offset) ; Skip past :START
+         (incf offset) ; Skip past timestamp
          (let ((sample (make-array 10 :adjustable t :fill-pointer 0)))
            (loop
               (when (not (mezzano.supervisor:threadp (next)))
@@ -132,47 +258,107 @@ thread states & call-stacks."
            (vector-push-extend sample profile-entries))))
     profile-entries))
 
-(defmacro with-allocation-profiling ((&whole options &key path verbosity prune ignore-functions) &body body)
-  "Profile BODY.
-:THREAD - Thread to sample.
-          If NIL, then sample all threads.
-          If T, then sample the current thread.
-          Can be a specific thread to sample.
-:BUFFER-SIZE - Size of the profiler's sample buffer.
-:PATH - Path to write th profiler report to, if NIL then the samples will be returned.
-:PRUNE - When :THREAD is T, try to prune away stack frames above the WITH-PROFILING call."
+(defmacro with-allocation-profiling ((&whole options &key repeat) &body body)
+  "Profile BODY."
   `(call-with-allocation-profiling (lambda () ,@body) ,@options))
 
-(defun call-with-allocation-profiling (function &key path (verbosity :report) (prune t) (ignore-functions *ignorable-function-names*))
-  (let* ((raw-buffer (make-array 0 :adjustable t :fill-pointer 0))
-         (results (let* ((mezzano.runtime::*allocation-profile* raw-buffer)
-                         (mezzano.runtime::*enable-allocation-profiling* t))
-                    (multiple-value-list (funcall function))))
-         (profile-buffer (decode-profile-buffer raw-buffer (if prune #'call-with-allocation-profiling nil) ignore-functions)))
-    (cond (path
-           (save-profile path profile-buffer :verbosity verbosity)
-           (values-list results))
-          (t profile-buffer))))
+(defun log-allocation-profile-entry (buffer words)
+  (let ((first nil)
+        (tree '()))
+    (block nil
+      (sys.int::map-backtrace
+       (lambda (i fp)
+         (let* ((fn (sys.int::function-from-frame (list nil fp nil))))
+           (when (eql i 3)
+             (setf first fn))
+           (when (eql fn #'call-with-allocation-profiling)
+             (return))
+           (when (> i 3)
+             (push fn tree))))))
+    (dolist (fn tree)
+      (let ((p (position fn buffer)))
+        (cond (p
+               (setf buffer (aref buffer (+ p 2))))
+              (t
+               (let ((new (make-array 3 :adjustable t :fill-pointer 0)))
+                 (vector-push-extend fn buffer)
+                 (vector-push-extend 0 buffer)
+                 (vector-push-extend new buffer)
+                 (setf buffer new))))))
+    (let ((p (position first buffer)))
+      (cond (p
+             (incf (aref buffer (+ p 1)) words))
+            (t
+             (let ((new (make-array 3 :adjustable t :fill-pointer 0)))
+               (vector-push-extend first buffer)
+               (vector-push-extend words buffer)
+               (vector-push-extend new buffer)))))))
+
+(defun name-for-flame-graph (fn)
+  (let ((*print-pretty* nil))
+    (substitute #\_ #\Space
+                (substitute #\L #\<
+                            (substitute #\G #\>
+                                        (format nil "~(~S~)" (sys.int::function-name fn)))))))
+
+(defun generate-allocation-flame-graph (profile stream threshold)
+  (labels ((frob (level stack)
+             (loop
+                for i from 0 below (length level) by 3
+                for fn = (aref level i)
+                for count = (aref level (+ i 1))
+                for next = (aref level (+ i 2))
+                for name = (name-for-flame-graph fn)
+                for stack2 = (list* name stack)
+                for first = t
+                do
+                  (when (>= count threshold)
+                    (dolist (entry (nreverse stack2))
+                      (cond (first (setf first nil))
+                            (t (write-char #\; stream)))
+                      (write-string entry stream))
+                    (write-char #\Space stream)
+                    (write count :stream stream)
+                    (terpri stream))
+                  (frob next stack2))))
+    (frob profile '()))
+  profile)
+
+(defun call-with-allocation-profiling (function &key repeat)
+  (let ((raw-buffer (make-array 3 :adjustable t :fill-pointer 0)))
+    (unwind-protect
+         (let ((mezzano.runtime::*allocation-profile-hook*
+                (lambda (words) (log-allocation-profile-entry raw-buffer words))))
+           (setf mezzano.runtime::*enable-allocation-profiling* t)
+           (dotimes (i (or repeat 1))
+             (funcall function)))
+      (setf mezzano.runtime::*enable-allocation-profiling* nil))
+    ;; TODO: Unify format with normal profiling.
+    raw-buffer))
 
 (defun save-profile (path profile &key (verbosity :report) order-by)
   "Convert a profile into an almost human-readable format."
   (with-open-file (s path :direction :output :if-exists :new-version :if-does-not-exist :create)
-    (when (member verbosity '(:report :full))
-      (let ((*standard-output* s))
-        (generate-report profile order-by))
-    (when (eql verbosity :full)
-      (loop
-         for sample across profile do
-           (format s "------------------------~%")
-           (loop
-              for thread across sample do
-                (format s "Thread ~S~%" (thread-sample-thread thread))
-                (format s " State ~S~%" (thread-sample-state thread))
-                (format s " Wait-item ~S~%" (thread-sample-wait-item thread))
-                (format s " Call-stack:~%")
-                (loop
-                   for (fn . offset) across (thread-sample-call-stack thread) do
-                     (format s "  ~S + ~D~%" fn offset))))))))
+    (cond ((eql verbosity :flame-graph)
+           (generate-flame-graph profile s))
+          (t
+           (format s "Version ~A~%" (lisp-implementation-version))
+           (when (member verbosity '(:report :full))
+             (generate-report profile order-by s))
+           (when (eql verbosity :full)
+             (loop
+                for sample across (profile-data profile) do
+                  (format s "------------------------~%")
+                  (loop
+                     for thread across sample do
+                       (format s "Thread ~S~%" (thread-sample-thread thread))
+                       (format s " State ~S~%" (thread-sample-state thread))
+                       (format s " Wait-item ~S~%" (thread-sample-wait-item thread))
+                       (format s " Call-stack:~%")
+                       (loop
+                          for (fn . offset) across (thread-sample-call-stack thread) do
+                            (format s "  ~S + ~D~%" fn offset))))))))
+  profile)
 
 (defstruct tree-branch
   value
@@ -233,7 +419,8 @@ thread states & call-stacks."
     :callers (make-hash-table)
     :callees (make-hash-table)))
 
-(defun generate-report (profile order-by)
+(defun generate-report (profile order-by stream)
+  (setf profile (profile-data profile))
   (let ((threads (make-hash-table)))
     (labels ((entry-for (thread function)
                (let ((thread-samples (gethash thread threads)))
@@ -296,10 +483,10 @@ thread states & call-stacks."
                       (incf total-total (profile-entry-total-count s))
                       (incf total-direct (profile-entry-direct-count s)))
                  ;; Print.
-                 (format t "~S:~%" thread)
+                 (format stream "~S:~%" thread)
                  (loop
                     for s across samples
-                    do (format t "  ~D ~D%~10T~D ~D%~20T~S~%"
+                    do (format stream "  ~D ~D%~15T~D ~D%~30T~S~%"
                                (profile-entry-direct-count s) (* (/ (profile-entry-direct-count s) total-direct) 100.0)
                                (profile-entry-total-count s) (* (/ (profile-entry-total-count s) total-total) 100.0)
                                (profile-entry-function s)))
@@ -307,12 +494,39 @@ thread states & call-stacks."
                  (loop
                     for s across samples
                     do
-                      (format t "  --------------------~%")
-                      (maphash (lambda (caller count)
-                                 (format t "    ~D~10T~S~%" count caller))
-                               (profile-entry-callers s))
-                      (format t "  ~S~10T~S~%" (profile-entry-total-count s) (profile-entry-function s))
-                      (maphash (lambda (callee count)
-                                 (format t "    ~D~10T~S~%" count callee))
-                               (profile-entry-callees s)))))
+                      (format stream "  --------------------~%")
+                      (let ((callers (make-array 10 :adjustable t :fill-pointer 0)))
+                        (maphash (lambda (caller count)
+                                   (vector-push-extend (cons caller count) callers))
+                                 (profile-entry-callers s))
+                        (setf callers (sort callers #'> :key #'cdr))
+                        (loop for (caller . count) across callers do
+                             (format stream "    ~D~10T~S~%" count caller)))
+                      (format stream "  ~S~10T~S~%" (profile-entry-total-count s) (profile-entry-function s))
+                      (let ((callees (make-array 10 :adjustable t :fill-pointer 0)))
+                        (maphash (lambda (callee count)
+                                   (vector-push-extend (cons callee count) callees))
+                                 (profile-entry-callees s))
+                        (setf callees (sort callees #'> :key #'cdr))
+                        (loop for (callee . count) across callees do
+                             (format stream "    ~D~10T~S~%" count callee))))))
              threads)))
+
+(defun generate-flame-graph (profile stream)
+  (loop
+     for sample across (profile-data profile)
+     do
+       (when (not (zerop (length sample)))
+         (loop
+            with first = t
+            for (fn . offset) across (reverse (thread-sample-call-stack (elt sample 0)))
+            do
+              (when (not (eql fn 0))
+                (cond (first (setf first nil))
+                      (t (write-char #\; stream)))
+                (let ((*print-pretty* nil))
+                  (write-string (name-for-flame-graph fn) stream))))
+         (write-char #\Space stream)
+         (write 1 :stream stream)
+         (terpri stream)))
+  profile)

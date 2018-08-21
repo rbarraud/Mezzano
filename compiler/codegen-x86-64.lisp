@@ -90,6 +90,10 @@
     (:tail :multiple)))
 
 (defun codegen-lambda (lambda)
+  (sys.c::detect-uses lambda)
+  (codegen-lambda-1 lambda))
+
+(defun codegen-lambda-1 (lambda)
   (let* ((*current-lambda* lambda)
          (*current-lambda-name* (lambda-information-name lambda))
          (*run-counter* 0)
@@ -213,40 +217,42 @@
            (homes (loop for (var . loc) across *stack-values*
                      for i from 0
                      when (and (lexical-variable-p var)
-                               (not (getf (lexical-variable-plist var) 'hide-from-debug-info))
+                               (not (getf (lexical-variable-plist var) 'sys.c::hide-from-debug-info))
                                (eql loc :home))
                      collect (list (lexical-variable-name var) i))))
       ;; Fix all the GC instructions.
-      (dolist (inst *gc-info-fixups*)
-        (setf (rest (last inst)) (list :layout (coerce (loop for value across *stack-values*
-                                                          collect (if (equal value '(:unboxed . :home))
-                                                                      0
-                                                                      1))
-                                                       'bit-vector))))
+      (let ((final-gc-layout (coerce (loop for value across *stack-values*
+                                        collect (if (equal value '(:unboxed . :home))
+                                                    0
+                                                    1))
+                                     'bit-vector)))
+        (dolist (inst *gc-info-fixups*)
+          (setf (rest (last inst)) (list :layout final-gc-layout))))
       (when sys.c::*enable-branch-tensioner*
         (setf final-code (tension-branches final-code)))
       (when sys.c::*trace-asm*
         (format t "~S:~%" *current-lambda-name*)
         (format t "Final values: ~S~%" *stack-values*)
         (format t "~{~S~%~}" final-code))
-      (sys.int::assemble-lap
-       final-code
-       *current-lambda-name*
-       (list :debug-info
-             *current-lambda-name*
-             homes
-             (when (lambda-information-environment-layout lambda)
-               (position (first (lambda-information-environment-layout lambda))
-                         *stack-values*
-                         :key #'car))
-             (second (lambda-information-environment-layout lambda))
-             (when *compile-file-pathname*
-               (namestring *compile-file-pathname*))
-             sys.int::*top-level-form-number*
-             (lambda-information-lambda-list lambda)
-             (lambda-information-docstring lambda))
-       nil
-       :x86-64))))
+      (sys.c:with-metering (:lap-assembly)
+        (sys.int::assemble-lap
+         final-code
+         *current-lambda-name*
+         (list :debug-info
+               *current-lambda-name*
+               homes
+               (when (lambda-information-environment-layout lambda)
+                 (position (first (lambda-information-environment-layout lambda))
+                           *stack-values*
+                           :key #'car))
+               (second (lambda-information-environment-layout lambda))
+               (when *compile-file-pathname*
+                 (namestring *compile-file-pathname*))
+               sys.int::*top-level-form-number*
+               (lambda-information-lambda-list lambda)
+               (lambda-information-docstring lambda))
+         nil
+         :x86-64)))))
 
 (defun emit-gc-info (&rest extra-stuff)
   (setf *last-gc-info* extra-stuff)
@@ -556,15 +562,28 @@
                                                 sys.int::+tag-object+)))))))
   (setf *r8-value* (list (gensym))))
 
+(defun cg-make-dx-cons (form)
+  (declare (ignore form))
+  (smash-r8)
+  (let ((slots (allocate-control-stack-slots 2 t)))
+    ;; Generate pointer.
+    (emit `(sys.lap-x86:lea64 :r8 (:rbp ,(+ (control-stack-frame-offset (+ slots 2 -1))
+                                            sys.int::+tag-cons+)))))
+  (setf *r8-value* (list (gensym))))
+
 (defun emit-nlx-thunk (thunk-name target-label multiple-values-active)
   (emit-trailer (thunk-name nil)
+    (emit (if multiple-values-active
+            `(:gc :frame :multiple-values 0)
+            `(:gc :frame)))
+    (emit `(sys.lap-x86:mov64 :rdx (:rax 24))) ; rbp
+    (dolist (slot (first *active-nl-exits*))
+      (emit `(sys.lap-x86:mov64 (:rdx ,(- (* (1+ slot) 8))) nil)))
     (if multiple-values-active
         (emit-gc-info :block-or-tagbody-thunk :rax :multiple-values 0)
         (emit-gc-info :block-or-tagbody-thunk :rax))
     (emit `(sys.lap-x86:mov64 :rsp (:rax 16))
-          `(sys.lap-x86:mov64 :rbp (:rax 24)))
-    (dolist (slot (first *active-nl-exits*))
-      (emit `(sys.lap-x86:mov64 (:stack ,slot) nil)))
+          `(sys.lap-x86:mov64 :rbp :rdx))
     (emit `(sys.lap-x86:jmp ,target-label))))
 
 (defun cg-block (form)
@@ -959,9 +978,7 @@ Returns an appropriate tag."
 
 (defun cg-multiple-value-call (form)
   (let ((value-form (ast-value-form form))
-        (fn-tag (let ((*for-value* t)) (cg-form (make-instance 'ast-call
-                                                               :name 'sys.int::%coerce-to-callable
-                                                               :arguments (list (ast-function-form form)))))))
+        (fn-tag (let ((*for-value* t)) (cg-form (ast-function-form form)))))
     (when (not fn-tag)
       (return-from cg-multiple-value-call nil))
     (let ((value-tag (let ((*for-value* :multiple))
@@ -1001,7 +1018,7 @@ Returns an appropriate tag."
                    `(sys.lap-x86:add64 :rdi 8)
                    `(sys.lap-x86:add64 :rsi 8)
                    `(sys.lap-x86:sub64 :rax 8)
-                   `(sys.lap-x86:jae ,loop-head)
+                   `(sys.lap-x86:ja ,loop-head)
                    loop-exit)
              ;; All done with the MV area.
              (emit-gc-info :pushed-values -5 :pushed-values-register :rcx))
@@ -1580,6 +1597,8 @@ Returns an appropriate tag."
               (match-builtin (ast-name form) (length (ast-arguments form))))))
     (cond ((eql (ast-name form) 'sys.c::make-dx-simple-vector)
            (cg-make-dx-simple-vector form))
+          ((eql (ast-name form) 'sys.c::make-dx-cons)
+           (cg-make-dx-cons form))
           ((and (eql *for-value* :predicate)
                 (member (ast-name form) '(null not))
                 (= (length (ast-arguments form)) 1))
@@ -1609,7 +1628,7 @@ Returns an appropriate tag."
   (cons form (incf *run-counter*)))
 
 (defun cg-lambda (form)
-  (list 'quote (codegen-lambda form)))
+  (list 'quote (codegen-lambda-1 form)))
 
 (defun raise-type-error (reg typespec)
   (unless (eql reg :r8)

@@ -25,7 +25,23 @@
 (defun write-char (character &optional stream)
   (cold-write-char character stream))
 
-(defun start-line-p (stream)
+(defun write-string (string &optional stream &key (start 0) end)
+  (unless end (setf end (length string)))
+  (dotimes (i (- end start))
+    (write-char (char string (+ start i)) stream))
+  string)
+
+(defun terpri (&optional stream)
+  (write-char #\Newline stream)
+  nil)
+
+(defun fresh-line (&optional stream)
+  (cond ((start-line-p stream)
+         nil)
+        (t (terpri stream)
+           t)))
+
+(defun start-line-p (&optional stream)
   (cold-start-line-p stream))
 
 (defun read-char (&optional stream (eof-error-p t) eof-value recursive-p)
@@ -76,9 +92,8 @@
      (write-char #\Newline)
      (format t "Please respond with \"yes\" or \"no\". ")))
 
-(defvar *cold-stream*)
 (defun streamp (object)
-  (eql object *cold-stream*))
+  (eql object :cold-stream))
 
 (defun %with-stream-editor (stream recursive-p function)
   (funcall function))
@@ -94,6 +109,8 @@
 
 (defun pathnamep (x) nil)
 (defun pathnames-equal (x y) nil)
+(defun hash-pathname (pathname depth)
+  (error "Early call to hash-pathname"))
 
 (declaim (special * ** ***))
 
@@ -186,17 +203,20 @@
 
 (defvar *warm-llf-files*)
 
+(defvar *cold-start-start-time*)
+(defvar *cold-start-end-time*)
+
 (defun initialize-lisp ()
   "A grab-bag of things that must be done before Lisp will work properly.
 Cold-generator sets up just enough stuff for functions to be called, for
 structures to exist, and for memory to be allocated, but not much beyond that."
+  (setf *cold-start-start-time* (get-internal-real-time))
   (cold-array-initialization)
   (setf *package* nil
-        *cold-stream* (make-cold-stream)
-        *terminal-io* *cold-stream*
-        *standard-output* *cold-stream*
-        *standard-input* *cold-stream*
-        *debug-io* *cold-stream*
+        *terminal-io* :cold-stream
+        *standard-output* :cold-stream
+        *standard-input* :cold-stream
+        *debug-io* :cold-stream
         * nil
         ** nil
         *** nil
@@ -221,24 +241,30 @@ structures to exist, and for memory to be allocated, but not much beyond that."
                      :common-lisp)
         *macroexpand-hook* 'funcall
         most-positive-fixnum #.(- (expt 2 (- 64 +n-fixnum-bits+ 1)) 1)
-        most-negative-fixnum #.(- (expt 2 (- 64 +n-fixnum-bits+ 1))))
+        most-negative-fixnum #.(- (expt 2 (- 64 +n-fixnum-bits+ 1)))
+        *gc-epoch* 0
+        *hash-table-unbound-value* (list "unbound hash-table entry")
+        *hash-table-tombstone* (list "hash-table tombstone"))
   ;; Wire up all the structure types.
-  (setf (get 'sys.int::structure-definition 'sys.int::structure-type) sys.int::*structure-type-type*)
-  (setf (get 'sys.int::structure-slot-definition 'sys.int::structure-type) sys.int::*structure-slot-type*)
+  (setf mezzano.runtime::*structure-types* (make-hash-table))
+  (%defstruct sys.int::*structure-type-type*)
+  (%defstruct sys.int::*structure-slot-type*)
   (dotimes (i (length *initial-structure-obarray*))
     (let ((defn (svref *initial-structure-obarray* i)))
-      (setf (get (structure-name defn) 'structure-type) defn)))
+      (%defstruct defn)))
   (write-line "Cold image coming up...")
   ;; Hook FREFs up where required.
+  (setf *setf-fref-table* (make-hash-table))
+  (setf *cas-fref-table* (make-hash-table))
   (dotimes (i (length *initial-fref-obarray*))
     (let* ((fref (svref *initial-fref-obarray* i))
            (name (%object-ref-t fref +fref-name+)))
       (when (consp name)
         (ecase (first name)
           ((setf)
-           (setf (get (second name) 'setf-fref) fref))
+           (setf (gethash (second name) *setf-fref-table*) fref))
           ((cas)
-           (setf (get (second name) 'cas-fref) fref))))))
+           (setf (gethash (second name) *cas-fref-table*) fref))))))
   ;; Run toplevel forms.
   (let ((*package* *package*))
     (dotimes (i (length *cold-toplevel-forms*))
@@ -270,20 +296,25 @@ structures to exist, and for memory to be allocated, but not much beyond that."
   (makunbound '*initial-structure-obarray*)
   (write-line "First GC.")
   (room)
-  (gc)
+  (gc :full t)
   (room)
   (write-line "Cold load complete.")
   (mezzano.supervisor:snapshot)
   (write-line "Loading warm modules.")
-  (dotimes (i (length *warm-llf-files*))
-    (write-string "Loading ")
-    (write-line (car (aref *warm-llf-files* i)))
-    (load-llf (mini-vector-stream (cdr (aref *warm-llf-files* i)))))
-  (makunbound '*warm-llf-files*)
-  (write-line "Post load GC.")
-  (room)
-  (gc)
-  (room)
-  (mezzano.supervisor:snapshot)
-  (write-line "Hello, world.")
-  (terpri))
+  (let ((*terminal-io* *terminal-io*))
+    (dotimes (i (length *warm-llf-files*))
+      (write-string "Loading ")
+      (write-line (car (aref *warm-llf-files* i)))
+      (load-llf (mini-vector-stream (cdr (aref *warm-llf-files* i)))))
+    (makunbound '*warm-llf-files*)
+    (write-line "Post load GC.")
+    (room)
+    (gc)
+    (room)
+    (mezzano.supervisor:snapshot)
+    (setf *cold-start-end-time* (get-internal-real-time))
+    (format t "Hello, world.~%Cold start took ~:D seconds (~:D seconds of GC time).~%"
+            (float (/ (- *cold-start-end-time*
+                         *cold-start-start-time*)
+                      internal-time-units-per-second))
+            *gc-time*)))

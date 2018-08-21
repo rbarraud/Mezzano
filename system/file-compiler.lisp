@@ -189,6 +189,8 @@ NOTE: Non-compound forms (after macro-expansion) are ignored."
 (defgeneric save-one-object (object object-map stream))
 
 (defmethod save-one-object ((object function) omap stream)
+  (when (not (eql (function-tag object) +object-tag-function+))
+    (error "Cannot save complicated function ~S" object))
   (dotimes (i (function-pool-size object))
     (save-object (function-pool-object object i) omap stream))
   ;; FIXME: This should be the fixup list.
@@ -428,8 +430,11 @@ NOTE: Non-compound forms (after macro-expansion) are ignored."
 (defun compile-file-load-time-value (form read-only-p)
   (declare (ignore read-only-p))
   (let ((ltv-sym (gensym "LOAD-TIME-VALUE-CELL")))
-    (compile-top-level-form `(setq ,ltv-sym ,form) nil)
-    `(symbol-value ',ltv-sym)))
+    (compile-top-level-form `(locally
+                                 (declare (special ,ltv-sym))
+                               (setq ,ltv-sym ,form))
+                            nil)
+    `(sys.int::symbol-global-value ',ltv-sym)))
 
 (defun compile-top-level-form (form env)
   (cond
@@ -459,7 +464,8 @@ NOTE: Non-compound forms (after macro-expansion) are ignored."
                                        (princ-to-string *compile-file-pathname*))
                                      sys.int::*top-level-form-number*
                                      lambda-list
-                                     docstring)
+                                     docstring
+                                     nil)
                                nil
                                #+x86-64 :x86-64
                                #+arm64 :arm64))
@@ -577,7 +583,8 @@ NOTE: Non-compound forms (after macro-expansion) are ignored."
                                   (external-format :default)
                                   (parallel *compile-parallel*))
   (with-open-file (input-stream input-file :external-format external-format)
-    (format t ";; Compiling file ~S.~%" input-file)
+    (when verbose
+      (format t ";; Compiling file ~S.~%" input-file))
     (let* ((*package* *package*)
            (*readtable* *readtable*)
            (*compile-verbose* verbose)
@@ -590,7 +597,10 @@ NOTE: Non-compound forms (after macro-expansion) are ignored."
            (*compile-file-pathname* (pathname (merge-pathnames input-file)))
            (*compile-file-truename* (truename *compile-file-pathname*))
            (*top-level-form-number* 0)
-           (sys.c::*load-time-value-hook* 'compile-file-load-time-value))
+           (sys.c::*load-time-value-hook* 'compile-file-load-time-value)
+           ;; Don't persist optimize proclaimations outside COMPILE-FILE.
+           (sys.c::*optimize-policy* (copy-list sys.c::*optimize-policy*))
+           (*gensym-counter* 0))
       (do ((form (read input-stream nil eof-marker)
                  (read input-stream nil eof-marker)))
           ((eql form eof-marker))
@@ -673,6 +683,7 @@ NOTE: Non-compound forms (after macro-expansion) are ignored."
     (format t ";; Writing compiler builtins to ~A.~%" output-file)
     (write-llf-header output-stream output-file)
     (let* ((*llf-forms* nil)
+           (sys.c::*use-new-compiler* nil)
            (omap (make-hash-table)))
       (loop
          for (name lambda) in (ecase target-architecture
@@ -702,26 +713,16 @@ NOTE: Non-compound forms (after macro-expansion) are ignored."
 
 (defun assemble-lap (code &optional name debug-info wired architecture)
   (multiple-value-bind (mc constants fixups symbols gc-data)
-      (ecase architecture
-        (:x86-64
-         (sys.lap-x86:assemble code
-           :base-address 16
-           :initial-symbols '((nil . :fixup)
-                              (t . :fixup)
-                              (:unbound-value . :fixup)
-                              (:undefined-function . :fixup)
-                              (:closure-trampoline . :fixup)
-                              (:funcallable-instance-trampoline . :fixup))
-           :info (list name debug-info)))
-        (:arm64
-         (mezzano.lap.arm64:assemble code
-           :base-address 16
-           :initial-symbols '((nil . :fixup)
-                              (t . :fixup)
-                              (:unbound-value . :fixup)
-                              (:undefined-function . :fixup)
-                              (:closure-trampoline . :fixup)
-                              (:funcallable-instance-trampoline . :fixup))
-           :info (list name debug-info))))
+      (sys.lap:perform-assembly-using-target
+       (sys.c::canonicalize-target architecture)
+       code
+       :base-address 16
+       :initial-symbols '((nil . :fixup)
+                          (t . :fixup)
+                          (:unbound-value . :fixup)
+                          (:undefined-function . :fixup)
+                          (:closure-trampoline . :fixup)
+                          (:funcallable-instance-trampoline . :fixup))
+       :info (list name debug-info))
     (declare (ignore symbols))
     (make-function-with-fixups sys.int::+object-tag-function+ mc fixups constants gc-data wired)))

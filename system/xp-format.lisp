@@ -121,6 +121,7 @@
     (or (catch :format-compilation-error
           `(apply #'maybe-initiate-xp-printing
                   (lambda (xp &rest args)
+                    (declare (ignorable xp args))
                     ,@(bind-initial
                        `((block top
                            ,@(let ((*get-arg-carefully* nil)
@@ -766,7 +767,9 @@
 (defun compile-format-string (string)
   (let ((form `(lambda (s &rest args)
                  (declare (sys.int::lambda-name (formatter ,string)))
-                 ,(formatter-fn string "CL-USER" t))))
+                 ,(formatter-fn string "CL-USER" t)))
+        (sys.c::*trace-asm* nil)
+        (mezzano.compiler.backend::*shut-up* t))
     (cond (*compiling-format-string*
            (values (mezzano.full-eval:eval-in-lexenv form nil) nil))
           (t

@@ -78,6 +78,11 @@
 
 (defun pass1-lambda (lambda env)
   "Perform macroexpansion, alpha-conversion, and canonicalization on LAMBDA."
+  (with-metering (:pass1)
+    (log-event :pass1-toplevel)
+    (pass1-lambda-inner lambda env)))
+
+(defun pass1-lambda-inner (lambda env)
   (multiple-value-bind (body lambda-list declares name docstring)
       (parse-lambda lambda)
     (multiple-value-bind (required optional rest enable-keys keys allow-other-keys aux fref-arg closure-arg count-arg)
@@ -94,13 +99,14 @@
                                   :lambda-list lambda-list
                                   :enable-keys enable-keys
                                   :allow-other-keys allow-other-keys
-                                  :optimize (optimize-qualities-in-environment optimize-env)
+                                  :environment optimize-env
                                   :plist (list :declares declares)))
              (*current-lambda* info)
              (aux-bindings '()))
         ;; Add required, optional and rest arguments to the environment & lambda.
         (labels ((add-var (name)
                    (let ((var (make-variable name declares)))
+                     (check-variable-bindable var)
                      (setf env (extend-environment env :variables (list (list name var))))
                      var)))
           (setf (lambda-information-required-args info) (mapcar #'add-var required))
@@ -217,7 +223,11 @@
                (compiler-macro-function name env))))
     (when (and fn
                (not (eql (inline-info-in-environment name env) 'notinline)))
-      (let ((expansion (funcall *macroexpand-hook* fn form env)))
+      (let ((expansion (handler-case (funcall *macroexpand-hook* fn form env)
+                         (error (c)
+                           (warn "Caught error ~A during compiler-macro expansion of ~S" c form)
+                           ;; Evaluate to FORM to reject expansion.
+                           form))))
         (when (not (eq expansion form))
           (return-from compiler-macroexpand-1
             (values expansion t))))))
@@ -249,7 +259,7 @@
     (if (eql declared-type 't)
         converted
         (make-instance 'ast-the
-                       :optimize (optimize-qualities-in-environment env)
+                       :environment env
                        :type (sys.int::typeexpand declared-type env)
                        :value converted))))
 
@@ -269,7 +279,7 @@
     ;; Self-evaluating forms are quoted.
     ((not (consp form))
      (make-instance 'ast-quote
-                    :optimize (optimize-qualities-in-environment env)
+                    :environment env
                     :value form))
     ;; ((lambda ...) ...) is converted to (funcall #'(lambda ...) ...)
     ((and (consp (first form))
@@ -303,6 +313,7 @@
          ((throw) (pass1-throw form env))
          ((unwind-protect) (pass1-unwind-protect form env))
          ((sys.int::%jump-table) (pass1-jump-table form env))
+         ((declare) (pass1-free-declare form env))
          (t (multiple-value-bind (expansion expanded-p)
                 (compiler-macroexpand-1 form env)
               (if expanded-p
@@ -321,12 +332,12 @@
     (cond ((lexical-variable-p fn)
            ;; Lexical function.
            (make-instance 'ast-call
-                          :optimize (optimize-qualities-in-environment env)
+                          :environemnt env
                           :name 'funcall
                           :arguments (list* fn args)))
           (t ;; Top-level function.
            (make-instance 'ast-call
-                          :optimize (optimize-qualities-in-environment env)
+                          :environment env
                           :name fn
                           :arguments args)))))
 
@@ -334,13 +345,13 @@
   (destructuring-bind (name &body forms) (cdr form)
     (check-type name symbol)
     (let* ((var (make-instance 'block-information
-                               :optimize (optimize-qualities-in-environment env)
+                               :environment env
                                :name name
                                :definition-point *current-lambda*))
            (env (extend-environment env
                                     :blocks (list (list name var)))))
       (make-instance 'ast-block
-                     :optimize (optimize-qualities-in-environment env)
+                     :environment env
                      :info var
                      :body (pass1-form `(progn ,@forms) env)))))
 
@@ -363,9 +374,8 @@
 
 (defun frob-flet-function (fn)
   "Turn an FLET/LABELS function definition into a symbolic name, a lexical variable and a lambda expression."
-  (multiple-value-bind (body declares)
-      (parse-declares (cddr fn))
-    ;; FIXME: docstring permitted here.
+  (multiple-value-bind (body declares docstring)
+      (sys.int::parse-declares (cddr fn) :permit-docstring t)
     (let* ((name (first fn))
            (var (make-instance 'lexical-variable
                                :name name
@@ -373,6 +383,7 @@
       (values name var `(lambda ,(second fn)
                           (declare (sys.int::lambda-name (flet ,name :in ,(lambda-information-name *current-lambda*)))
                                    ,@declares)
+                          ,docstring
                           (block ,(if (consp name)
                                       (second name)
                                       name)
@@ -399,19 +410,19 @@
 (defun pass1-flet (form env)
   (destructuring-bind (functions &body forms) (cdr form)
     (multiple-value-bind (body declares)
-        (parse-declares forms)
+        (sys.int::parse-declares forms)
       (let ((bindings '())
             (env (extend-environment env
                                      :declarations (remove-if-not (lambda (x) (eql x 'optimize))
                                                                   declares
                                                                   :key #'first))))
         (make-instance 'ast-let
-                       :optimize (optimize-qualities-in-environment env)
+                       :environment env
                        :bindings (mapcar (lambda (x)
                                            (multiple-value-bind (sym var lambda)
                                                (frob-flet-function x)
                                              (push (list sym var) bindings)
-                                             (let ((lambda (pass1-lambda lambda env)))
+                                             (let ((lambda (pass1-lambda-inner lambda env)))
                                                (when (function-declared-dynamic-extent-p sym declares)
                                                  (setf (getf (lambda-information-plist lambda) 'declared-dynamic-extent) t))
                                                (when (function-declared-notinline-p sym declares)
@@ -427,7 +438,7 @@
   (destructuring-bind (name) (cdr form)
     (if (and (consp name)
              (eq (first name) 'lambda))
-        (pass1-lambda name env)
+        (pass1-lambda-inner name env)
         (let* ((var (find-function name env)))
           (cond ((lexical-variable-p var)
                  ;; Lexical function.
@@ -436,7 +447,7 @@
                  var)
                 (t ;; Top-level function.
                  (make-instance 'ast-function
-                                :optimize (optimize-qualities-in-environment env)
+                                :environment env
                                 :name name)))))))
 
 (defun pass1-go (form env)
@@ -447,14 +458,14 @@
       (incf (go-tag-use-count tag))
       (pushnew *current-lambda* (go-tag-used-in tag))
       (make-instance 'ast-go
-                     :optimize (optimize-qualities-in-environment env)
+                     :environment env
                      :target tag
                      :info (go-tag-tagbody tag)))))
 
 (defun pass1-if (form env)
   (destructuring-bind (test then &optional else) (cdr form)
     (make-instance 'ast-if
-                   :optimize (optimize-qualities-in-environment env)
+                   :environment env
                    :test (pass1-form test env)
                    :then (pass1-form then env)
                    :else (pass1-form else env))))
@@ -462,7 +473,7 @@
 (defun pass1-labels (form env)
   (destructuring-bind (functions &body forms) (cdr form)
     (multiple-value-bind (body declares)
-        (parse-declares forms)
+        (sys.int::parse-declares forms)
       ;; Generate variables & lambda expressions for each function.
       (let* ((raw-bindings (mapcar (lambda (x)
                                      (multiple-value-list (frob-flet-function x)))
@@ -475,9 +486,9 @@
                                                                    declares
                                                                    :key #'first))))
         (make-instance 'ast-let
-                       :optimize (optimize-qualities-in-environment env)
+                       :environment env
                        :bindings (mapcar (lambda (x)
-                                           (let ((lambda (pass1-lambda (third x) env)))
+                                           (let ((lambda (pass1-lambda-inner (third x) env)))
                                              (when (function-declared-dynamic-extent-p (first x) declares)
                                                (setf (getf (lambda-information-plist lambda) 'declared-dynamic-extent) t))
                                              (when (function-declared-notinline-p (first x) declares)
@@ -506,7 +517,7 @@
 (defun pass1-let (form env)
   (destructuring-bind (bindings &body forms) (cdr form)
     (multiple-value-bind (body declares)
-        (parse-declares forms)
+        (sys.int::parse-declares forms)
       (let* ((names (loop for binding in bindings collect (parse-let-binding binding)))
              (env (extend-environment env
                                       :declarations (append
@@ -522,7 +533,7 @@
                                       (list name init-form var))))
                                 bindings)))
         (make-instance 'ast-let
-                       :optimize (optimize-qualities-in-environment env)
+                       :environment env
                        :bindings (mapcar (lambda (b)
                                            (list (third b) (pass1-form (wrap-initform-with-the (second b) (third b) declares) env)))
                                          variables)
@@ -569,16 +580,16 @@
 (defun pass1-let* (form env)
   (destructuring-bind (bindings &body forms) (cdr form)
     (multiple-value-bind (body declares)
-        (parse-declares forms)
+        (sys.int::parse-declares forms)
       (let* ((env (extend-environment env
                                       :declarations (remove-if-not (lambda (x) (eql x 'optimize))
                                                                    declares
                                                                    :key #'first)))
              (result (make-instance 'ast-let
-                                    :optimize (optimize-qualities-in-environment env)
+                                    :environment env
                                     :bindings '()
                                     :body (make-instance 'ast-quote
-                                                         :optimize (optimize-qualities-in-environment env)
+                                                         :environment env
                                                          :value 'nil)))
              (inner result)
              (var-names '()))
@@ -589,7 +600,7 @@
             (let ((var (make-variable name declares)))
               (check-variable-bindable var)
               (setf (body inner) (make-instance 'ast-let
-                                                :optimize (optimize-qualities-in-environment env)
+                                                :environment env
                                                 :bindings (list (list var (pass1-form (wrap-initform-with-the init-form var declares) env)))
                                                 :body (make-instance 'ast-quote :value 'nil))
                     inner (body inner)
@@ -607,7 +618,7 @@
 
 (defun pass1-locally-body (forms env)
   (multiple-value-bind (body declares)
-      (parse-declares forms)
+      (sys.int::parse-declares forms)
     (pass1-form `(progn ,@body) (extend-environment env :declarations declares))))
 
 (defun pass1-locally (form env)
@@ -623,7 +634,7 @@
         (when (not env)
           (setf env (gensym "ENV")))
         (multiple-value-bind (body declares)
-            (parse-declares forms)
+            (sys.int::parse-declares forms)
           (list name
                 (sys.int::eval-in-lexenv
                  `(lambda (,whole ,env)
@@ -650,8 +661,8 @@
        (pass1-form `(funcall ,function-form) env))
       (1 ; One form, transform as-is.
        (make-instance 'ast-multiple-value-call
-                      :optimize (optimize-qualities-in-environment env)
-                      :function-form (pass1-form function-form env)
+                      :environment env
+                      :function-form (pass1-form `(sys.int::%coerce-to-callable ,function-form) env)
                       :value-form (pass1-form (first forms) env)))
       (t ; Many forms, simplify.
        (pass1-form `(apply ,function-form
@@ -663,7 +674,7 @@
   (destructuring-bind (first-form &body forms) (cdr form)
     (if forms
         (make-instance 'ast-multiple-value-prog1
-                       :optimize (optimize-qualities-in-environment env)
+                       :environment env
                        :value-form (pass1-form first-form env)
                        :body (pass1-form `(progn ,@forms) env))
         (pass1-form first-form env))))
@@ -675,7 +686,7 @@
         ((null (cddr form))
          (pass1-form (cadr form) env))
         (t (make-instance 'ast-progn
-                          :optimize (optimize-qualities-in-environment env)
+                          :environment env
                           :forms (pass1-implicit-progn (rest form) env)))))
 
 ;; Turn PROGV into a call to %PROGV.
@@ -688,7 +699,7 @@
 (defun pass1-quote (form env)
   (destructuring-bind (thing) (cdr form)
     (make-instance 'ast-quote
-                   :optimize (optimize-qualities-in-environment env)
+                   :environment env
                    :value thing)))
 
 (defun pass1-return-from (form env)
@@ -699,7 +710,7 @@
       (incf (lexical-variable-use-count tag))
       (pushnew *current-lambda* (lexical-variable-used-in tag))
       (make-instance 'ast-return-from
-                     :optimize (optimize-qualities-in-environment env)
+                     :environment env
                      :target tag
                      :value (pass1-form result env)
                      :info tag))))
@@ -719,7 +730,7 @@
              ((null (rest forms))
               (first forms))
              (t (make-instance 'ast-progn
-                               :optimize (optimize-qualities-in-environment env)
+                               :environment env
                                :forms (nreverse forms)))))
     (when (null (cdr i))
       (error-program-error "Odd number of arguments to SETQ."))
@@ -744,7 +755,7 @@
          (incf (lexical-variable-write-count var))
          (pushnew *current-lambda* (lexical-variable-used-in var))
          (push (make-instance 'ast-setq
-                              :optimize (optimize-qualities-in-environment env)
+                              :environment env
                               :variable var
                               :value (pass1-form wrapped-value env))
                forms))
@@ -761,7 +772,7 @@
             ()
             "Bad SYMBOL-MACROLET definition.")
     (multiple-value-bind (body declares)
-        (parse-declares body)
+        (sys.int::parse-declares body)
       (let* ((defs (loop
                       for (name expansion) in definitions
                       do
@@ -773,7 +784,6 @@
                           (error-program-error "Attempt to bind constant ~S as a symbol-macro." name))
                       collect (list name
                                     (make-instance 'symbol-macro
-                                                   :optimize (optimize-qualities-in-environment env)
                                                    :name name
                                                    :expansion expansion)))))
         (pass1-form `(progn ,@body) (extend-environment env
@@ -808,14 +818,14 @@
 
 (defun pass1-tagbody (form env)
   (let* ((tb (make-instance 'tagbody-information
-                            :optimize (optimize-qualities-in-environment env)
+                            :environment env
                             :name (gensym "TAGBODY")
                             :definition-point *current-lambda*))
          (parsed-body (parse-tagbody-body (rest form)))
          (go-tags (loop
                      for (name form) in parsed-body
                      collect (let ((tag (make-instance 'go-tag
-                                                       :optimize (optimize-qualities-in-environment env)
+                                                       :environment env
                                                        :name name
                                                        :tagbody tb)))
                                (push tag (tagbody-information-go-tags tb))
@@ -826,7 +836,7 @@
                                               for go-tag in go-tags
                                               collect (list name go-tag)))))
     (make-instance 'ast-tagbody
-                   :optimize (optimize-qualities-in-environment env)
+                   :environment env
                    :info tb
                    :statements (loop
                                   for (name form) in parsed-body
@@ -836,7 +846,7 @@
 (defun pass1-the (form env)
   (destructuring-bind (value-type form) (cdr form)
     (make-instance 'ast-the
-                   :optimize (optimize-qualities-in-environment env)
+                   :environment env
                    :type (sys.int::typeexpand value-type env)
                    :value (pass1-form form env))))
 
@@ -864,17 +874,24 @@
   (destructuring-bind (protected-form &body cleanup-forms) (cdr form)
     (if cleanup-forms
         (make-instance 'ast-unwind-protect
-                       :optimize (optimize-qualities-in-environment env)
+                       :environment env
                        :protected-form (pass1-form protected-form env)
-                       :cleanup-function (pass1-lambda `(lambda ()
-                                                          (declare (sys.int::lambda-name (unwind-protect-cleanup :in ,(lambda-information-name *current-lambda*))))
-                                                          (progn ,@cleanup-forms))
+                       :cleanup-function (pass1-lambda-inner `(lambda ()
+                                                                (declare (sys.int::lambda-name (unwind-protect-cleanup :in ,(lambda-information-name *current-lambda*))))
+                                                                (progn ,@cleanup-forms))
                                                        env))
         (pass1-form protected-form env))))
 
 (defun pass1-jump-table (form env)
   (destructuring-bind (test-form &body forms) (cdr form)
     (make-instance 'ast-jump-table
-                   :optimize (optimize-qualities-in-environment env)
+                   :environment env
                    :value (pass1-form test-form env)
                    :targets (pass1-implicit-progn forms env))))
+
+(defun pass1-free-declare (form env)
+  (warn "Saw free DECLARE expression ~S" form)
+  (pass1-form `(error 'sys.int::simple-program-error
+                      :format-control "Attemted to evaluate DECLARE expression ~S"
+                      :format-arguments (list ',form))
+              env))

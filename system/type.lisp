@@ -25,13 +25,26 @@
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
 (defun %deftype (name expander)
+  (remprop name 'maybe-class)
   (setf (get name 'type-expander) expander))
 (defun %define-compound-type (name function)
+  (remprop name 'maybe-class)
   (setf (get name 'compound-type) function))
 (defun %define-compound-type-optimizer (name function)
+  (remprop name 'maybe-class)
   (setf (get name 'compound-type-optimizer) function))
 (defun %define-type-symbol (name function)
+  (remprop name 'maybe-class)
   (setf (get name 'type-symbol) function))
+
+(defun %compiler-defclass (name)
+  ;; If name exists as a type, do nothing.
+  ;; Otherwise, mark it as a potential class.
+  (unless (or (get name 'type-expander)
+              (get name 'compound-type)
+              (get name 'type-symbol))
+    (setf (get name 'maybe-class) t))
+  name)
 )
 
 (deftype bit ()
@@ -56,10 +69,10 @@
     (error 'type-error :expected-type '(integer 1) :datum n))
   `(integer 0 (,n)))
 
-(deftype short-float ()
-  'single-float)
-(deftype long-float ()
-  'double-float)
+(deftype short-float (&optional min max)
+  `(single-float ,min ,max))
+(deftype long-float (&optional min max)
+  `(double-float ,min ,max))
 
 (deftype fixnum ()
   `(integer ,most-negative-fixnum ,most-positive-fixnum))
@@ -197,6 +210,26 @@
              (<= object max)))))
 (%define-compound-type 'float 'float-type-p)
 
+(defun single-float-type-p (object type)
+  (multiple-value-bind (min max)
+      (canonicalize-real-type type 'single-float)
+    (and (single-float-p object)
+         (or (eql min '*)
+             (>= object min))
+         (or (eql max '*)
+             (<= object max)))))
+(%define-compound-type 'single-float 'single-float-type-p)
+
+(defun double-float-type-p (object type)
+  (multiple-value-bind (min max)
+      (canonicalize-real-type type 'double-float)
+    (and (double-float-p object)
+         (or (eql min '*)
+             (>= object min))
+         (or (eql max '*)
+             (<= object max)))))
+(%define-compound-type 'double-float 'double-float-type-p)
+
 (eval-when (:compile-toplevel :load-toplevel :execute)
 (defun compile-rational-type (object type)
   "Convert a type specifier with interval designators like INTEGER, REAL and RATIONAL."
@@ -204,6 +237,10 @@
          `(typep ,object ',type))
         (t (destructuring-bind (base &optional (min '*) (max '*))
                type
+             (when (and (eql base 'integer)
+                        (eql min most-negative-fixnum)
+                        (eql max most-positive-fixnum))
+               (return-from compile-rational-type `(sys.int::fixnump ,object)))
              `(and (typep ,object ',base)
                    ,(cond ((eql min '*) 't)
                           ((consp min)
@@ -251,6 +288,22 @@
              (typep (cdr object) cdr-type)))))
 (%define-compound-type 'cons 'cons-type-p)
 
+(eval-when (:compile-toplevel :load-toplevel :execute)
+(defun compile-cons-type (object type)
+  (destructuring-bind (&optional (car-type '*) (cdr-type '*))
+      (cdr type)
+    (when (eql car-type '*)
+      (setf car-type 't))
+    (when (eql cdr-type '*)
+      (setf cdr-type 't))
+    `(and (consp ,object)
+          ,@(when (not (eql car-type 't))
+              `((typep (car ,object) ',car-type)))
+          ,@(when (not (eql cdr-type 't))
+              `((typep (cdr ,object) ',cdr-type))))))
+(%define-compound-type-optimizer 'cons 'compile-cons-type)
+)
+
 (deftype null ()
   '(eql nil))
 
@@ -259,6 +312,7 @@
 (%define-type-symbol 'cons 'consp)
 (%define-type-symbol 'symbol 'symbolp)
 (%define-type-symbol 'number 'numberp)
+(%define-type-symbol 'complex 'complexp)
 (%define-type-symbol 'real 'realp)
 (%define-type-symbol 'fixnum 'fixnump)
 (%define-type-symbol 'bignum 'bignump)
@@ -290,6 +344,21 @@
              (typep (realpart object)
                     (upgraded-complex-part-type typespec))))))
 (%define-compound-type 'complex 'complex-type)
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+(defun compile-complex-type (object type)
+  (destructuring-bind (&optional (typespec '*))
+      (if (listp type)
+          (rest type)
+          '(*))
+    (cond ((eql typespec '*)
+           `(complexp ,object))
+          (t
+           (let ((upgraded (upgraded-complex-part-type typespec)))
+             `(and (complexp ,object)
+                   (typep (realpart ,object) ',upgraded)))))))
+(%define-compound-type-optimizer 'complex 'compile-complex-type)
+)
 
 ;; Not exactly correct. This is a class, SUBTYPEP has problems with that.
 (deftype list ()
@@ -415,6 +484,7 @@
 (eval-when (:compile-toplevel :load-toplevel :execute)
 ;;; This is annoyingly incomplete and isn't particularly well integrated.
 (defun subtypep (type-1 type-2 &optional environment)
+  (declare (notinline typep)) ; ### Boostrap hack.
   (when (equal type-1 type-2)
     (return-from subtypep (values t t)))
   (when (typep type-2 'class)
@@ -577,6 +647,7 @@
            (values nil t)))))
 
 (defun subclassp (class-1 class-2)
+  (declare (notinline typep)) ; ### Boostrap hack.
   (let ((c1 (if (typep class-1 'class)
                 class-1
                 (find-class class-1 nil))))
@@ -584,12 +655,19 @@
           (t (values nil nil)))))
 )
 
+(defun class-typep (object class)
+  (let ((obj-class (class-of object)))
+    (or (eq obj-class class)
+        (member class (mezzano.clos:class-precedence-list obj-class)
+                :test #'eq))))
+
 (defun typep (object type-specifier &optional environment)
+  (declare (notinline find-class)) ; ### Boostrap hack.
   (when (and (or (std-instance-p type-specifier)
                  (funcallable-std-instance-p type-specifier))
              (subclassp (class-of type-specifier) (find-class 'mezzano.clos:class)))
     (return-from typep
-      (member type-specifier (mezzano.clos:class-precedence-list (class-of object)))))
+      (class-typep object type-specifier)))
   (let ((type-symbol (cond ((symbolp type-specifier)
                             type-specifier)
                            ((and (consp type-specifier)
@@ -600,7 +678,7 @@
         (when test
           (return-from typep (funcall test object))))))
   (when (symbolp type-specifier)
-    (let ((struct-type (get type-specifier 'structure-type)))
+    (let ((struct-type (get-structure-type type-specifier nil)))
       (when struct-type
         (return-from typep
           (and (structure-object-p object)
@@ -612,7 +690,8 @@
     (when (or (std-instance-p object)
               (funcallable-std-instance-p object))
       (let ((class (find-class type-specifier nil)))
-        (when (and class (member class (mezzano.clos:class-precedence-list (class-of object))))
+        (when (and class
+                   (class-typep object class))
           (return-from typep t)))))
   (let ((compound-test (get (if (symbolp type-specifier)
                                 type-specifier
@@ -660,10 +739,15 @@
                                  (symbolp (first type-specifier)))
                             (first type-specifier)))))
     (when type-symbol
-      (let ((test (get type-symbol 'type-symbol)))
-        (when test
-          (return-from compile-typep-expression
-            `(funcall ',test ,object))))))
+      (cond ((eql type-symbol 't)
+             (return-from compile-typep-expression `(progn ,object 't)))
+            ((eql type-symbol 'nil)
+             (return-from compile-typep-expression `(progn ,object 'nil)))
+            (t
+             (let ((test (get type-symbol 'type-symbol)))
+               (when test
+                 (return-from compile-typep-expression
+                   `(funcall ',test ,object))))))))
   (when (and (listp type-specifier)
              (symbolp (first type-specifier)))
     (let ((compiler (get (first type-specifier) 'compound-type-optimizer)))
@@ -674,10 +758,26 @@
             (return-from compile-typep-expression
               `(let ((,sym ,object))
                  ,code)))))))
-  (multiple-value-bind (expansion expanded-p)
-      (typeexpand-1 type-specifier)
-    (when expanded-p
-      (compile-typep-expression object expansion))))
+  (when (and (symbolp type-specifier)
+             (get type-specifier 'sys.int::maybe-class nil))
+    (return-from compile-typep-expression
+      (let ((class (gensym "CLASS")))
+        `(let ((,class (mezzano.clos:find-class-in-reference
+                        (load-time-value (mezzano.clos:class-reference ',type-specifier))
+                        nil)))
+           (if ,class
+               (class-typep ,object ,class)
+               nil)))))
+  (when (symbolp type-specifier)
+    (let ((struct-type (get-structure-type type-specifier nil))
+          (obj-sym (gensym "OBJECT")))
+      (when struct-type
+        (return-from compile-typep-expression
+          `(let ((,obj-sym ,object))
+             (and (structure-object-p ,obj-sym)
+                  (or (eq (%struct-slot ,obj-sym 0) ',struct-type)
+                      (structure-type-p ,obj-sym ',struct-type))))))))
+  nil)
 )
 
 (define-compiler-macro typep (&whole whole object type-specifier &optional environment)
@@ -689,8 +789,8 @@
                (= (list-length type-specifier) 2)
                (eql (first type-specifier) 'quote))
     (return-from typep whole))
-  (setf type-specifier (second type-specifier))
-  (or (compile-typep-expression object type-specifier)
+  (or (compile-typep-expression object
+                                (typeexpand (second type-specifier) environment))
       whole))
 
 (defun type-of (object)
@@ -734,7 +834,7 @@
        (#b010101 `(simple-array (complex double-float) (,(array-dimension object 0))))
        (#b010110 `(simple-array (complex short-float) (,(array-dimension object 0))))
        (#b010111 `(simple-array (complex long-float) (,(array-dimension object 0))))
-       (#b011000 `(simple-array xmm-vector (,(array-dimension object 0))))
+       (#b011000 'object-tag-011000)
        (#b011001 'object-tag-011001)
        (#b011010 'object-tag-011010)
        (#b011100 (if (eql (array-rank object) 1)
@@ -760,7 +860,7 @@
        (#b101100 'object-tag-101100)
        (#b101101 'object-tag-101101)
        (#b101110 'object-tag-101110)
-       (#b101111 'object-tag-101111)
+       (#b101111 'mezzano.simd:mmx-vector)
        (#b110000
         (cond ((eql object 'nil) 'null)
               ((eql object 't) 'boolean)
@@ -768,7 +868,7 @@
               (t 'symbol)))
        (#b110001 (structure-name (%struct-slot object 0)))
        (#b110010 (class-name (class-of object)))
-       (#b110011 'xmm-vector)
+       (#b110011 'mezzano.simd:sse-vector)
        (#b110100 'mezzano.supervisor:thread)
        (#b110101 'unbound-value)
        (#b110110 'function-reference)
@@ -776,7 +876,7 @@
        (#b111000 'pinned-cons)
        (#b111001 'freelist-entry)
        (#b111010 'weak-pointer)
-       (#b111011 'object-tag-111011)
+       (#b111011 'mezzano.delimited-continuations:delimited-continuation)
        (#b111100 'compiled-function)
        (#b111101 'closure)
        (#b111110 (class-name (class-of object)))

@@ -6,16 +6,21 @@
 ;;; AST objects.
 
 (defclass ast-node ()
-  ((%optimize-qualities :initarg :optimize :accessor ast-optimize))
-  (:default-initargs :optimize '()))
+  ((%optimize-qualities :initarg :optimize :accessor ast-optimize)
+   (%inline-declarations :initarg :inline-declarations :accessor ast-inline-declarations))
+  (:default-initargs :optimize '() :inline-declarations '()))
 
-(defmethod initialize-instance :after ((instance ast-node) &key inherit &allow-other-keys)
+(defmethod initialize-instance :after ((instance ast-node) &key inherit environment &allow-other-keys)
   (when inherit
     (loop
        for (quality value) on (ast-optimize inherit) by #'cddr
        do (setf (getf (ast-optimize instance) quality)
                 (max value
-                     (getf (ast-optimize instance) quality 0))))))
+                     (getf (ast-optimize instance) quality 0))))
+    (setf (ast-inline-declarations instance) (ast-inline-declarations inherit)))
+  (when environment
+    (setf (ast-optimize instance) (optimize-qualities-in-environment environment))
+    (setf (ast-inline-declarations instance) (inline-qualities-in-environment environment))))
 
 (defclass lambda-information (ast-node)
   ((%name :initarg :name :accessor lambda-information-name)
@@ -474,8 +479,9 @@
 
 (defun detect-uses (form)
   "Walk form, refreshing variable use counts & locations."
-  (detect-uses-1 form)
-  form)
+  (with-metering (:detect-uses)
+    (detect-uses-1 form)
+    form))
 
 (defgeneric detect-uses-1 (form))
 
@@ -692,6 +698,9 @@
                        (when (lambda-information-count-arg form)
                          `(sys.int::&count ,(unparse-compiler-form (lambda-information-count-arg form)))))
         (declare (sys.int::lambda-name ,(lambda-information-name form))
+                 ,@(when (and (lambda-information-rest-arg form)
+                              (lexical-variable-dynamic-extent (lambda-information-rest-arg form)))
+                         `((dynamic-extent ,(unparse-compiler-form (lambda-information-rest-arg form)))))
                  ,@(when (ast-optimize form)
                      `((optimize ,@(ast-optimize form)))))
         ,(unparse-compiler-form (lambda-information-body form))))))

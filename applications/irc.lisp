@@ -2,12 +2,14 @@
 ;;;; This code is licensed under the MIT license.
 
 (defpackage :irc-client
-  (:use :cl :sys.net)
+  (:use :split-sequence :cl :sys.net)
   (:export #:spawn))
 
 (in-package :irc-client)
 
 (defvar *irc-history* (make-instance 'mezzano.line-editor:history-table))
+(defvar *irc-init-file* "SYS:HOME;IRC-INIT.lisp")
+(defvar *default-nick* "Mezzie")
 
 (defparameter *numeric-replies*
   '((401 :err-no-such-nick)
@@ -348,6 +350,14 @@ If ORIGIN is a server name, then only the host is valid. Nick and ident will be 
                           (current-channel irc) text))
         (t (error "Not connected or not joined to a channel."))))
 
+(define-command msg (irc text)
+  "MSG <target> [message]
+   Send a message to or begin a conversation with the specified target."
+   (multiple-value-bind (split-text returned-index) (split-sequence #\Space text :start 0 :count 1)
+     (let ((leftovers (subseq text returned-index)))
+          (cond ((irc-connection irc)
+                 (buffered-format (irc-connection irc) "PRIVMSG ~A :~A~%" (elt split-text 0) leftovers))))))
+
 (define-command me (irc text)
   "ACTION <text>
   Send a CTCP ACTION to the current channel."
@@ -603,6 +613,8 @@ If ORIGIN is a server name, then only the host is valid. Nick and ident will be 
                  mezzano.gui.font:*default-monospace-font*
                  mezzano.gui.font:*default-monospace-font-size*))
           (fifo (mezzano.supervisor:make-fifo 50)))
+      (ignore-errors
+        (load *irc-init-file* :if-does-not-exist nil))
       (mezzano.gui.compositor:with-window (window fifo 640 480)
         (let* ((framebuffer (mezzano.gui.compositor:window-buffer window))
                (frame (make-instance 'mezzano.gui.widgets:frame
@@ -647,7 +659,8 @@ If ORIGIN is a server name, then only the host is valid. Nick and ident will be 
                                    :frame frame
                                    :font font
                                    :display-pane display-pane
-                                   :input-pane input-pane)))
+                                   :input-pane input-pane
+				   :nickname *default-nick*)))
           (setf (slot-value input-pane '%irc) irc)
           (draw-seperating-line irc (mezzano.gui.compositor:width window) (mezzano.gui.compositor:height window) framebuffer)
           (mezzano.gui.widgets:draw-frame frame)

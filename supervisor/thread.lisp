@@ -478,7 +478,11 @@ Interrupts must be off and the global thread lock must be held."
        (catch 'terminate-thread
          ;; Footholds in a new thread are inhibited until the terminate-thread
          ;; catch block is established, to guarantee that it's always available.
-         (decf (thread-inhibit-footholds (current-thread)))
+         (let ((thread (current-thread)))
+           (sys.int::%atomic-fixnum-add-object thread +thread-inhibit-footholds+ -1)
+           (when (zerop (sys.int::%object-ref-t thread +thread-inhibit-footholds+))
+             (dolist (fh (sys.int::%xchg-object thread +thread-pending-footholds+ nil))
+               (funcall fh))))
          (funcall function))
     ;; Cleanup, terminate the thread.
     (thread-final-cleanup)))
@@ -642,7 +646,7 @@ Interrupts must be off and the global thread lock must be held."
           (thread-global-prev sys.int::*pager-thread*) sys.int::*snapshot-thread*
           (thread-global-next sys.int::*disk-io-thread*) nil
           (thread-global-prev sys.int::*disk-io-thread*) sys.int::*pager-thread*)
-    (setf *default-stack-size* (* 256 1024)))
+    (setf *default-stack-size* (* 1024 1024)))
   (setf *n-running-cpus* 1)
   (reset-ephemeral-thread sys.int::*bsp-idle-thread* #'idle-thread :runnable :idle)
   (reset-ephemeral-thread sys.int::*snapshot-thread* #'snapshot-thread :sleeping :supervisor)
@@ -723,9 +727,15 @@ Interrupts must be off and the global thread lock must be held."
        (let ((,thread (current-thread)))
          (sys.int::%atomic-fixnum-add-object ,thread +thread-inhibit-footholds+ -1)
          (when (zerop (sys.int::%object-ref-t ,thread +thread-inhibit-footholds+))
-           (let ((,footholds (sys.int::%xchg-object ,thread +thread-pending-footholds+ nil)))
-             (dolist (,fh ,footholds)
-               (funcall ,fh))))))))
+           (run-pending-footholds))))))
+
+(declaim (inline run-pending-footholds))
+(defun run-pending-footholds ()
+  (let ((footholds (sys.int::%xchg-object (mezzano.supervisor:current-thread)
+                                          mezzano.supervisor::+thread-pending-footholds+
+                                          nil)))
+    (dolist (fh footholds)
+      (funcall fh))))
 
 (defun unsleep-thread (thread)
   (let ((did-wake (safe-without-interrupts (thread)
@@ -804,7 +814,7 @@ Interrupts must be off and the global thread lock must be held."
   (assert (not (eql thread (current-thread))))
   (establish-thread-foothold thread #'stop-current-thread)
   (loop
-     (when (eql (sample-thread-state thread) :stopped)
+     (when (member (sample-thread-state thread) '(:stopped :dead))
        (return))
      (thread-yield))
   (values))
@@ -870,7 +880,7 @@ Interrupts must be off and the global thread lock must be held."
     ;; Don't hold the mutex over the thunk, it's a spinlock and disables interrupts.
     (multiple-value-prog1
         (funcall thunk)
-      (with-mutex (*world-stop-lock*)
+      (with-world-stop-lock ()
         ;; Release the dogs!
         (safe-without-interrupts (self)
           (acquire-global-thread-lock)
@@ -881,6 +891,10 @@ Interrupts must be off and the global thread lock must be held."
 
 (defmacro with-world-stopped (&body body)
   `(call-with-world-stopped (dx-lambda () ,@body)))
+
+(defun world-stopped-p ()
+  "Returns true if the world is stopped."
+  *world-stopper*)
 
 (defun call-with-pseudo-atomic (thunk)
   (when (eql *world-stopper* (current-thread))

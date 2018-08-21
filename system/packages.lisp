@@ -182,7 +182,8 @@
     (multiple-value-bind (other-symbol status)
         (find-symbol (symbol-name symbol) q)
       (when (and (not (eq symbol other-symbol))
-                 status)
+                 status
+                 (not (member other-symbol (package-%shadowing-symbols q))))
         (restart-case
             (error "Newly exported symbol ~S conflicts with symbol ~S in package ~S." symbol other-symbol q)
           (shadow-symbol ()
@@ -375,6 +376,10 @@
       (import (list symbol) p)
       (when (eql p *keyword-package*)
         (setf (symbol-mode symbol) :special)
+        (when (not (eq (mezzano.runtime::fast-symbol-value-cell symbol)
+                       (mezzano.runtime::symbol-global-value-cell symbol)))
+          ;; Fault to preserve the state as much as possible.
+          (sys.int::%%unreachable))
         (setf (symbol-value symbol) symbol)
         (setf (symbol-mode symbol) :constant)
         (export (list symbol) p))

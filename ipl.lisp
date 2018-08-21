@@ -3,21 +3,12 @@
 
 (in-package :cl-user)
 
-(defun sys.int::setup-for-release ()
-  (load "tools/load-sources.lisp")
-  (setf (sys.int::symbol-global-value '*package*) (find-package :cl-user))
-  (setf *default-pathname-defaults* (pathname "LOCAL:>")
-        mezzano.file-system::*home-directory* *default-pathname-defaults*)
-  (setf (mezzano.file-system:find-host :remote) nil)
-  (when (y-or-n-p "Snapshot?")
-    (sys.int::snapshot-and-exit)))
-
 ;; Fast eval mode.
 (setf sys.int::*eval-hook* 'mezzano.fast-eval:eval-in-lexenv)
 
 ;; Host where the initial system is kept.
 ;; Change the IP to the host computer's local IP.
-(mezzano.file-system.remote:add-simple-file-host :remote sys.int::*file-server-host-ip*)
+(mezzano.file-system.remote:add-remote-file-host :remote sys.int::*file-server-host-ip*)
 ;; Use PATHNAME instead of #p because the cross-compiler doesn't support #p.
 ;; Point *DEFAULT-PATHNAME-DEFAULTS* at the full path to the source tree.
 (setf *default-pathname-defaults* (pathname (concatenate 'string "REMOTE:" sys.int::*mezzano-source-path*)))
@@ -41,7 +32,7 @@ Make sure there is a virtio-net NIC attached.~%")
   (format t "Using network card ~S.~%" (first mezzano.network.ethernet::*cards*))
   ;; Check connectivity to the file-server.
   (let ((fs-address (mezzano.network.ip:make-ipv4-address sys.int::*file-server-host-ip*)))
-    (format t "File server has address ~A, port ~D.~%" fs-address mezzano.file-system.remote::*default-simple-file-port*)
+    (format t "File server has address ~A, port ~D.~%" fs-address mezzano.file-system.remote::*default-remote-file-port*)
     (when (mezzano.network.ip:address-equal
            (mezzano.network.ip:address-network fs-address 24)
            (mezzano.network.ip:make-ipv4-address "10.0.2.0"))
@@ -80,12 +71,16 @@ Make sure there is a virtio-net NIC attached.~%")
 (eval (read-from-string "(mezzano.file-system.local:add-local-file-host :local)"))
 
 ;; ASDF.
-(sys.int::cal (merge-pathnames "asdf/asdf.lisp" (user-homedir-pathname)))
+(sys.int::cal "sys:home;asdf;build;asdf.lisp")
+
 (defun home-source-registry ()
   `(:source-registry
     (:tree ,(user-homedir-pathname))
     :inherit-configuration))
 (eval (read-from-string "(push 'home-source-registry asdf:*default-source-registries*)"))
+
+;; Split-sequence
+(require :split-sequence)
 
 ;; A bunch of GUI related systems.
 (require :zpb-ttf)
@@ -106,28 +101,32 @@ Make sure there is a virtio-net NIC attached.~%")
 (require :cl-video-gif)
 (require :cl-video-wav)
 (require :cl-wav)
-(require :swank)
+;; Swank doesn't really support logical pathname shenanigans.
+(load (merge-pathnames "slime/swank-loader.lisp" (user-homedir-pathname)))
+(eval (read-from-string "(swank-loader::init)"))
 (eval (read-from-string "(swank:create-server :style :spawn :dont-close t)"))
 
 ;; And the GUI.
-(sys.int::cal "gui/package.lisp")
-(sys.int::cal "gui/colour.lisp")
-(sys.int::cal "gui/surface.lisp")
-(sys.int::cal "gui/blit.lisp")
+(sys.int::cal "sys:source;gui;package.lisp")
+(sys.int::cal "sys:source;gui;colour.lisp")
+(sys.int::cal "sys:source;gui;surface.lisp")
+(sys.int::cal "sys:source;gui;blit.lisp")
+;; SIMD code requires use of the new compiler.
 #+x86-64
-(sys.int::cal "gui/blit-x86-64.lisp")
+(let ((sys.c::*use-new-compiler* t))
+  (sys.int::cal "sys:source;gui;blit-x86-64-simd.lisp"))
 #+arm64
-(sys.int::cal "gui/blit-generic.lisp")
-(sys.int::cal "gui/keymaps.lisp")
-(sys.int::cal "gui/compositor.lisp")
+(sys.int::cal "sys:source;gui;blit-generic.lisp")
+(sys.int::cal "sys:source;gui;keymaps.lisp")
+(sys.int::cal "sys:source;gui;compositor.lisp")
 #+x86-64
-(sys.int::cal "gui/input-drivers.lisp")
+(sys.int::cal "sys:source;gui;input-drivers.lisp")
 #+arm64
-(sys.int::cal "gui/input-drivers-virtio.lisp")
+(sys.int::cal "sys:source;gui;input-drivers-virtio.lisp")
 #+x86-64
-(sys.int::cal "gui/virtualbox-guest-helper.lisp")
-(sys.int::cal "system/unifont.lisp")
-(sys.int::cal "gui/basic-repl.lisp")
+(sys.int::cal "sys:source;gui;virtualbox-guest-helper.lisp")
+(sys.int::cal "sys:source;system;unifont.lisp")
+(sys.int::cal "sys:source;gui;basic-repl.lisp")
 (eval (read-from-string "(mezzano.gui.basic-repl:spawn)"))
 (sys.int::cal "sys:source;gui;font.lisp")
 (sys.int::cal "sys:source;gui;image.lisp")
@@ -170,6 +169,7 @@ Make sure there is a virtio-net NIC attached.~%")
 (sys.int::cal "sys:source;gui;widgets.lisp")
 (sys.int::cal "sys:source;line-edit-mixin.lisp")
 (sys.int::cal "sys:source;gui;popup-io-stream.lisp")
+;;(eval (read-from-string "(setf (sys.int::symbol-global-value '*terminal-io*) (make-instance 'mezzano.gui.popup-io-stream:lazy-popup-io-stream))"))
 (sys.int::cal "sys:source;gui;xterm.lisp")
 (sys.int::cal "sys:source;applications;telnet.lisp")
 (sys.int::cal "sys:source;applications;mandelbrot.lisp")
@@ -183,10 +183,15 @@ Make sure there is a virtio-net NIC attached.~%")
 (sys.int::cal "sys:source;gui;music-player.lisp")
 (sys.int::cal "sys:source;applications;filer.lisp")
 (sys.int::cal "sys:source;applications;memory-monitor.lisp")
+(sys.int::cal "sys:source;gui;starfield.lisp")
+;;(eval (read-from-string "(setf mezzano.gui.compositor:*screensaver-spawn-function* 'mezzano.gui.starfield:spawn)"))
+
+;; Other stuff.
 (sys.int::cal "sys:source;file;http.lisp")
+(sys.int::cal "sys:source;system;disassemble.lisp")
 
 ;; Load the desktop image and start the desktop.
-(sys.int::copy-file (merge-pathnames "Ducks.jpg" (user-homedir-pathname))
+(sys.int::copy-file (merge-pathnames "19377769093_c9cb23b4d3_b.jpg" (user-homedir-pathname))
                     "LOCAL:>Desktop.jpeg"
                     '(unsigned-byte 8))
 (defvar sys.int::*desktop* (eval (read-from-string "(mezzano.gui.desktop:spawn :image \"LOCAL:>Desktop.jpeg\")")))

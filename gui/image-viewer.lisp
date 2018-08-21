@@ -45,14 +45,18 @@
                  mezzano.gui.font:*default-monospace-font*
                  mezzano.gui.font:*default-monospace-font-size*))
           (fifo (mezzano.supervisor:make-fifo 50))
-          (image (mezzano.gui.image:load-image path)))
+          (image (if (mezzano.gui:surface-p path)
+                     path
+                     (mezzano.gui.image:load-image path))))
       (multiple-value-bind (width height)
           (compute-window-size image)
         (mezzano.gui.compositor:with-window (window fifo width height)
           (let* ((framebuffer (mezzano.gui.compositor:window-buffer window))
                  (frame (make-instance 'mezzano.gui.widgets:frame
                                        :framebuffer framebuffer
-                                       :title (namestring path)
+                                       :title (if (mezzano.gui:surface-p path)
+                                                  "<surface>"
+                                                  (namestring path))
                                        :close-button-p t
                                        :damage-function (mezzano.gui.widgets:default-damage-function window)))
                  (viewer (make-instance 'image-viewer
@@ -63,12 +67,27 @@
                                         :frame frame)))
             (multiple-value-bind (left right top bottom)
                 (mezzano.gui.widgets:frame-size frame)
-              (mezzano.gui:bitblt :set
-                                  (mezzano.gui:surface-width image) (mezzano.gui:surface-height image)
-                                  image 0 0
-                                  framebuffer
-                                  (+ left (- (truncate (- width left right) 2) (truncate (mezzano.gui:surface-width image) 2)))
-                                  (+ top (- (truncate (- height top bottom) 2) (truncate (mezzano.gui:surface-height image) 2))))
+              (ecase (mezzano.gui:surface-format image)
+                (:argb32
+                 (mezzano.gui:bitblt :set
+                                     (mezzano.gui:surface-width image) (mezzano.gui:surface-height image)
+                                     image 0 0
+                                     framebuffer
+                                     (+ left (- (truncate (- width left right) 2) (truncate (mezzano.gui:surface-width image) 2)))
+                                     (+ top (- (truncate (- height top bottom) 2) (truncate (mezzano.gui:surface-height image) 2)))))
+                ((:a8 :a1)
+                 (mezzano.gui:bitset :set
+                                     (- width left right) (- height top bottom)
+                                     (mezzano.gui:make-colour 0 0 0)
+                                     framebuffer
+                                     left top)
+                 (mezzano.gui:bitset :blend
+                                     (mezzano.gui:surface-width image) (mezzano.gui:surface-height image)
+                                     (mezzano.gui:make-colour 1 1 1)
+                                     framebuffer
+                                     (+ left (- (truncate (- width left right) 2) (truncate (mezzano.gui:surface-width image) 2)))
+                                     (+ top (- (truncate (- height top bottom) 2) (truncate (mezzano.gui:surface-height image) 2)))
+                                     image 0 0)))
               (mezzano.gui.widgets:draw-frame frame)
               (mezzano.gui.compositor:damage-window window
                                                     0 0
@@ -84,7 +103,8 @@
                    (return-from main))))))))))
 
 (defun spawn (path)
-  (setf path (merge-pathnames path))
+  (when (not (mezzano.gui:surface-p path))
+    (setf path (merge-pathnames path)))
   (mezzano.supervisor:make-thread (lambda () (main path))
                                   :name (format nil "Image Viewer - ~S" path)
                                   :initial-bindings `((*terminal-io* ,(make-instance 'mezzano.gui.popup-io-stream:popup-io-stream

@@ -346,6 +346,10 @@
     (:tail :multiple)))
 
 (defun codegen-lambda (lambda)
+  (sys.c::detect-uses lambda)
+  (codegen-lambda-1 lambda))
+
+(defun codegen-lambda-1 (lambda)
   (let* ((*current-lambda* lambda)
          (*current-lambda-name* (lambda-information-name lambda))
          (*run-counter* 0)
@@ -480,7 +484,7 @@
            (homes (loop for (var . loc) across *stack-values*
                      for i from 0
                      when (and (lexical-variable-p var)
-                               (not (getf (lexical-variable-plist var) 'hide-from-debug-info))
+                               (not (getf (lexical-variable-plist var) 'sys.c::hide-from-debug-info))
                                (eql loc :home))
                      collect (list (lexical-variable-name var) i))))
       ;; Fix all the GC instructions.
@@ -535,11 +539,9 @@
     (nconc
      (list entry-label
            ;; Create control stack frame.
-           ;; FIXME: Not quite right. ARM calls start with no return address
-           ;; pushed! must modify no-frame layout meaning to assume ra.
            `(:gc :no-frame :incoming-arguments :rcx)
            `(lap:stp :x29 :x30 (:pre :sp -16))
-           `(:gc :no-frame :incoming-arguments :rcx :layout #*0)
+           `(:gc :no-frame :incoming-arguments :rcx :layout #*00)
            `(lap:add :x29 :sp :xzr)
            `(:gc :frame :incoming-arguments :rcx))
      ;; Emit the argument count test.
@@ -1331,6 +1333,7 @@ Returns an appropriate tag."
          (emit (second (assoc go-tag *rename-list*)))
          (when (cg-form stmt)
            (setf need-exit-label t)
+           (smash-x0)
            (emit `(lap:b ,exit-label))))
     (when escapes
       ;; Emit the jump-table.
@@ -1555,7 +1558,7 @@ Returns an appropriate tag."
   (cons form (incf *run-counter*)))
 
 (defun cg-lambda (form)
-  (list 'quote (codegen-lambda form)))
+  (list 'quote (codegen-lambda-1 form)))
 
 (defun cg-jump-table (form)
   (let* ((value (ast-value form))

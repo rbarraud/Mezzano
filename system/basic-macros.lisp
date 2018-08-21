@@ -136,7 +136,25 @@
   `(multiple-value-call #'list ,value-form))
 
 (defmacro nth-value (n form)
-  `(nth ,n (multiple-value-list ,form)))
+  (cond ((and (integerp n)
+              (<= 0 n 32)) ; Don't generate a zillion temporaries for large N.
+         (let ((temps (loop
+                         repeat n
+                         collect (gensym)))
+               (value (gensym "VALUE")))
+           `(multiple-value-bind (,@temps ,value)
+                ,form
+              (declare (ignore ,@temps))
+              ,value)))
+        (t
+         (let ((n-value (gensym "N"))
+               (values (gensym "VALUES")))
+           `(let ((,n-value ,n))
+              (flet ((nth-value-closure (&rest ,values)
+                       (declare (dynamic-extent ,values))
+                       (nth ,n-value ,values)))
+                (declare (dynamic-extent #'nth-value-closure))
+                (multiple-value-call #'nth-value-closure ,form)))))))
 
 (defmacro case (keyform &body cases)
   (let ((test-key (gensym "CASE-KEY")))

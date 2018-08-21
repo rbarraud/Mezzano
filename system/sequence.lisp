@@ -9,6 +9,11 @@
 (deftype sequence ()
   '(or vector list))
 
+(declaim (inline check-test-test-not))
+(defun check-test-test-not (test test-not)
+  (when (and test test-not)
+    (error "TEST and TEST-NOT specified")))
+
 (defun length (sequence)
   (etypecase sequence
     (list (or (list-length sequence)
@@ -82,8 +87,7 @@
 
 (declaim (inline position))
 (defun position (item sequence &key test test-not key from-end (start 0) end)
-  (when (and test test-not)
-    (error "Both :test and :test-not specified"))
+  (check-test-test-not test test-not)
   (when test-not (setf test (complement test-not)))
   (unless test (setf test 'eql))
   (position-if (lambda (x) (funcall test item x)) sequence
@@ -118,8 +122,7 @@
     n))
 
 (defun count (item sequence &key key from-end (start 0) end test test-not)
-  (when (and test test-not)
-    (error "Both :test and :test-not specified"))
+  (check-test-test-not test test-not)
   (when test-not (setf test (complement test-not)))
   (unless test (setf test 'eql))
   (count-if #'(lambda (y) (funcall test item y)) sequence :key key :from-end from-end :start start :end end))
@@ -159,8 +162,7 @@
                  do (return val))))))))
 
 (defun find (item sequence &key key test test-not (start 0) end from-end)
-  (when (and test test-not)
-    (error "Both :test and :test-not specified"))
+  (check-test-test-not test test-not)
   (when test-not (setf test (complement test-not)))
   (unless test (setf test 'eql))
   (find-if (lambda (x) (funcall test item x)) sequence :key key :start start :end end :from-end from-end))
@@ -171,43 +173,52 @@
 (declaim (inline remove-if remove remove-if-not))
 (defun remove-if (test sequence &key from-end (start 0) end count key)
   (unless key (setf key 'identity))
-  (when (or (not (eql start 0))
-            end)
-    (error "start/end not implemented"))
   (when from-end
-    (setf sequence (reverse sequence)))
-  (check-type count (or null integer))
+    (setf sequence (reverse sequence))
+    (rotatef start end)
+    (when (null start) (setf start 0))
+    (if (= end 0)
+        (setf end nil)
+        (setf end (- (length sequence) end))))
+  (when count
+    (check-type count (or null integer)))
   (etypecase sequence
     (list
-     (let* ((list (cons nil nil))
-            (tail list))
-       (dolist (e sequence)
-         (when (not (and (funcall test (funcall key e))
-                         (or (null count)
-                             (>= (decf count) 0))))
-           (setf (cdr tail) (cons e nil)
-                 tail (cdr tail))))
-       (if from-end
-           (reverse (cdr list))
-           (cdr list))))
+     (loop
+        with remaining = count
+        for idx from 0
+        for e in sequence
+        when (or (< idx start)
+                 (and (numberp end)
+                      (<= end idx))
+                 (not (and (funcall test (funcall key e))
+                           (or (null count)
+                               (>= (decf remaining) 0)))))
+        collect e into result
+        finally (return (if from-end
+                            (nreverse result)
+                            result))))
     (vector
      (loop
-        with result = (make-array (length sequence) :element-type (array-element-type sequence) :fill-pointer 0)
+        with remaining = count
+        with result = (make-array (length sequence)
+                                  :element-type (array-element-type sequence)
+                                  :fill-pointer 0)
+        for idx from 0
         for e across sequence
-        when (not (and (funcall test (funcall key e))
-                       (or (null count)
-                           (>= (decf count) 0))))
-        do
-          (vector-push e result)
-          (when count
-            (decf count))
+        when (or (< idx start)
+                 (and (numberp end)
+                      (<= end idx))
+                 (not (and (funcall test (funcall key e))
+                           (or (null count)
+                               (>= (decf remaining) 0)))))
+        do (vector-push e result)
         finally (return (if from-end
-                            (reverse result)
+                            (nreverse result)
                             result))))))
 
 (defun remove (item sequence &key from-end test test-not (start 0) end count key)
-  (when (and test test-not)
-    (error "Both :test and :test-not specified"))
+  (check-test-test-not test test-not)
   (when test-not (setf test (complement test-not)))
   (unless test (setf test 'eql))
   (remove-if (lambda (x) (funcall test item x)) sequence
@@ -234,30 +245,33 @@
 (defun delete-if-not (test sequence &key from-end (start 0) end count key)
   (remove-if-not test sequence :from-end from-end :start start :end end :count count :key key))
 
-(defun remove-duplicates (sequence &key from-end test test-not key) ; (start 0) end
-  (when (and test test-not)
-    (error "Both :test and :test-not specified"))
+(defun remove-duplicates (sequence &key from-end test test-not key (start 0) end)
+  (check-test-test-not test test-not)
   (when test-not (setf test (complement test-not)))
   (unless test (setf test 'eql))
   (unless key (setf key 'identity))
+  (when (or (not (eql start 0))
+            end)
+    (setf sequence (subseq sequence start end)))
   (etypecase sequence
-    (list (if from-end
-              (do* ((result (cons nil nil))
-                    (tail result)
-                    (i sequence (cdr i)))
-                   ((null i)
-                    (cdr result))
-                (unless (member (car i) (cdr result) :test test :key key)
-                  (setf (cdr tail) (cons (car i) nil)
-                        tail (cdr tail))))
-              (do* ((result (cons nil nil))
-                    (tail result)
-                    (i sequence (cdr i)))
-                   ((null i)
-                    (cdr result))
-                (unless (member (car i) (cdr i) :test test :key key)
-                  (setf (cdr tail) (cons (car i) nil)
-                        tail (cdr tail))))))
+    (list
+     (if from-end
+         (do* ((result (cons nil nil))
+               (tail result)
+               (i sequence (cdr i)))
+              ((null i)
+               (cdr result))
+           (unless (member (car i) (cdr result) :test test :key key)
+             (setf (cdr tail) (cons (car i) nil)
+                   tail (cdr tail))))
+         (do* ((result (cons nil nil))
+               (tail result)
+               (i sequence (cdr i)))
+              ((null i)
+               (cdr result))
+           (unless (member (car i) (cdr i) :test test :key key)
+             (setf (cdr tail) (cons (car i) nil)
+                   tail (cdr tail))))))
     (vector
      (when from-end
        (setf sequence (reverse sequence)))
@@ -274,6 +288,15 @@
          (setf result (nreverse result)))
        ;; Simplify result.
        (subseq result 0)))))
+
+(defun delete-duplicates (sequence &key from-end test test-not (start 0) end key)
+  (remove-duplicates sequence
+                     :from-end from-end
+                     :test test
+                     :test-not test-not
+                     :start start
+                     :end end
+                     :key key))
 
 (defun subseq-list (sequence start end)
   ;; Seek in sequence
@@ -300,8 +323,8 @@
   (when (or (> 0 start) (> start end))
     (error "Invalid bounding index designators ~S ~S for ~S." start end sequence))
   (let ((new-vector (make-array (- end start) :element-type (array-element-type sequence))))
-    (dotimes (i (- end start) new-vector)
-      (setf (aref new-vector i) (aref sequence (+ start i))))))
+    (replace new-vector sequence :start2 start :end2 end)
+    new-vector))
 
 (defun subseq (sequence start &optional end)
   (if (listp sequence)
@@ -312,37 +335,95 @@
   (replace sequence value :start1 start :end1 end)
   value)
 
+(defparameter *sort-list-vector-crossover-length* 128
+  "A list longer than this will be coerced to a vector, sorted, then coerced back to a list.")
+
 ;; Selection sort!
+(defun sort-list (sequence predicate key)
+  (let ((len (length sequence)))
+    (cond ((> len *sort-list-vector-crossover-length*)
+           (let ((vec (make-array len)))
+             (loop
+                for i from 0
+                for elt in sequence
+                do (setf (svref vec i) elt))
+             (sort-vector vec predicate key)
+             (loop
+                for i from 0
+                for cons on sequence
+                do (setf (car cons) (svref vec i))))
+           sequence)
+          (t
+           (cond ((endp sequence)
+                  '())
+                 (t
+                  (do* ((ipos sequence (cdr ipos))
+                        (imin ipos ipos))
+                       ((null ipos)
+                        sequence)
+                    (do ((i (cdr ipos) (cdr i)))
+                        ((null i))
+                      (when (funcall predicate (funcall key (car i)) (funcall key (car imin)))
+                        (setf imin i)))
+                    (when (not (eq imin ipos))
+                      ;; Swap
+                      (let ((old-ipos (car ipos))
+                            (old-imin (car imin)))
+                        (setf (car ipos) old-imin
+                              (car imin) old-ipos))))))))))
+
+;; Heapsort implementation from https://en.wikipedia.org/wiki/Heapsort
+(defun sort-vector (sequence predicate key)
+  (labels ((i-parent (i)
+             (floor (1- i) 2))
+           (i-left-child (i)
+             (+ (* i 2) 1))
+           (i-right-child (i)
+             (+ (* i 2) 2))
+           (heapify ()
+             (let ((start (i-parent (1- (length sequence)))))
+               (loop while (>= start 0) do
+                    (sift-down start (1- (length sequence)))
+                    (decf start))))
+           (cmp (a b)
+             (funcall predicate (funcall key (aref sequence a)) (funcall key (aref sequence b))))
+           (sift-down (start end)
+             (let ((root start))
+               (loop while (<= (i-left-child root) end) do
+                    (let ((child (i-left-child root))
+                          (swap root))
+                      (when (cmp swap child)
+                        (setf swap child))
+                      (when (and (<= (1+ child) end)
+                                 (cmp swap (1+ child)))
+                        (setf swap (1+ child)))
+                      (cond ((eql swap root)
+                             (return))
+                            (t
+                             (rotatef (aref sequence root)
+                                      (aref sequence swap))
+                             (setf root swap))))))))
+    (heapify)
+    (let ((end (1- (length sequence))))
+      (loop while (> end 0) do
+           (rotatef (aref sequence end) (aref sequence 0))
+           (decf end)
+           (sift-down 0 end)))
+    sequence))
+
 (defun sort (sequence predicate &key key)
   (unless key (setf key 'identity))
   (etypecase sequence
     (list
-     (when sequence
-       (do* ((ipos sequence (cdr ipos))
-             (imin ipos ipos))
-            ((null ipos)
-             sequence)
-         (do ((i (cdr ipos) (cdr i)))
-             ((null i))
-           (when (funcall predicate (funcall key (car i)) (funcall key (car imin)))
-             (setf imin i)))
-         (when (not (eq imin ipos))
-           ;; Swap
-           (let ((old-ipos (car ipos))
-                 (old-imin (car imin)))
-             (setf (car ipos) old-imin
-                   (car imin) old-ipos))))))
+     (sort-list sequence predicate key))
     (vector
-     (dotimes (ipos (length sequence) sequence)
-       (let ((imin ipos))
-         (dotimes (i (- (length sequence) ipos 1))
-           (when (funcall predicate (funcall key (aref sequence (+ ipos i 1))) (funcall key (aref sequence imin)))
-             (setf imin (+ ipos i 1))))
-         (when (not (eq imin ipos))
-           (let ((old-ipos (aref sequence ipos))
-                 (old-imin (aref sequence imin)))
-           (setf (aref sequence imin) old-ipos
-                 (aref sequence ipos) old-imin))))))))
+     (sort-vector sequence predicate key))))
+
+(defun check-vector-sorted (vector predicate &key (key 'identity))
+  (dotimes (i (1- (length vector)))
+    (assert (funcall predicate
+                     (funcall key (aref vector i))
+                     (funcall key (aref vector (1+ i)))))))
 
 (defun concatenate (result-type &rest sequences)
   (declare (dynamic-extent sequences))
@@ -352,8 +433,8 @@
     (cond
       ((subtypep true-result-type 'null)
        (if (= total-length 0)
-                  nil
-                  (error "Too many elements for result-type NULL.")))
+           nil
+           (error "Too many elements for result-type NULL.")))
       ((subtypep true-result-type 'list)
        (let* ((result (cons nil nil))
               (tail result))
@@ -387,71 +468,61 @@
          result))
       (t (error "Don't understand result-type ~S." result-type)))))
 
+(define-compiler-macro every (predicate first-seq &rest more-sequences)
+  (let* ((predicate-sym (gensym "PREDICATE"))
+         (block (gensym "EVERY"))
+         (n-sequences (1+ (length more-sequences)))
+         (element-vars (loop
+                          repeat n-sequences
+                          collect (gensym))))
+    `(let ((,predicate-sym ,predicate))
+       (block ,block
+         (map nil (lambda ,element-vars
+                    (when (not (funcall ,predicate-sym ,@element-vars))
+                      (return-from ,block nil)))
+              ,first-seq ,@more-sequences)
+         t))))
+
 (defun every (predicate first-seq &rest more-sequences)
-  (declare (dynamic-extent more-sequences))
-  (cond ((and (listp first-seq)
-              (null more-sequences))
-         ;; One list, used to implement the other cases.
-         (dolist (x first-seq t)
-           (unless (funcall predicate x)
-             (return nil))))
-        ((and (listp first-seq)
-              (every 'listp more-sequences))
-         ;; Many lists.
-         (do* ((lists (cons first-seq more-sequences)))
-              (nil)
-           (do* ((call-list (cons nil nil))
-                 (call-tail call-list (cdr call-tail))
-                 (itr lists (cdr itr)))
-                ((null itr)
-                 (when (not (apply predicate (cdr call-list)))
-                   (return-from every nil)))
-             (when (null (car itr))
-               (return-from every t))
-             (setf (cdr call-tail) (cons (caar itr) nil)
-                   (car itr) (cdar itr)))))
-        (t ;; One or more non-list sequence.
-         (let* ((sequences (cons first-seq more-sequences))
-                (n-elts (reduce 'min (mapcar 'length sequences))))
-           (dotimes (i n-elts t)
-             (unless (apply predicate (mapcar (lambda (seq) (elt seq i)) sequences))
-               (return nil)))))))
+  (apply #'map nil (lambda (&rest seqs)
+                     (when (not (apply predicate seqs))
+                       (return-from every nil)))
+         first-seq more-sequences)
+  t)
+
+(define-compiler-macro some (predicate first-seq &rest more-sequences)
+  (let* ((predicate-sym (gensym "PREDICATE"))
+         (block (gensym "SOME"))
+         (n-sequences (1+ (length more-sequences)))
+         (element-vars (loop
+                          repeat n-sequences
+                          collect (gensym)))
+         (pred-result (gensym)))
+    `(let ((,predicate-sym ,predicate))
+       (block ,block
+         (map nil (lambda ,element-vars
+                    (let ((,pred-result (funcall ,predicate-sym ,@element-vars)))
+                      (when ,pred-result
+                        (return-from ,block ,pred-result))))
+              ,first-seq ,@more-sequences)
+         nil))))
 
 (defun some (predicate first-seq &rest more-sequences)
-  (declare (dynamic-extent more-sequences))
-  (cond ((and (listp first-seq)
-              (null more-sequences))
-         ;; One list.
-         (dolist (x first-seq nil)
-           (let ((result (funcall predicate x)))
-             (when result
-               (return result)))))
-        ((and (listp first-seq)
-              (every 'listp more-sequences))
-         ;; Many lists.
-         (do* ((lists (cons first-seq more-sequences)))
-              (nil)
-           (do* ((call-list (cons nil nil))
-                 (call-tail call-list (cdr call-tail))
-                 (itr lists (cdr itr)))
-                ((null itr)
-                 (let ((result (apply predicate (cdr call-list))))
-                   (when result
-                     (return-from some result))))
-             (when (null (car itr))
-               (return-from some nil))
-             (setf (cdr call-tail) (cons (caar itr) nil)
-                   (car itr) (cdar itr)))))
-        (t ;; One or more non-list sequence.
-         (let* ((sequences (cons first-seq more-sequences))
-                (n-elts (reduce 'min (mapcar 'length sequences))))
-           (dotimes (i n-elts nil)
-             (let ((result (apply predicate (mapcar (lambda (seq) (elt seq i)) sequences))))
-               (when result
-                 (return result))))))))
+  (apply #'map nil (lambda (&rest seqs)
+                     (let ((pred-result (apply predicate seqs)))
+                       (when pred-result
+                         (return-from some pred-result))))
+         first-seq more-sequences)
+  nil)
+
+(define-compiler-macro notany (predicate first-seq &rest more-sequences)
+  `(not (some ,predicate ,first-seq ,@more-sequences)))
 
 (defun notany (predicate first-sequence &rest more-sequences)
   (not (apply 'some predicate first-sequence more-sequences)))
+
+(define-compiler-macro notevery (predicate first-seq &rest more-sequences)
+  `(not (every ,predicate ,first-seq ,@more-sequences)))
 
 (defun notevery (predicate first-sequence &rest more-sequences)
   (not (apply 'every predicate first-sequence more-sequences)))
@@ -468,65 +539,198 @@
     (setf end1 (+ start1 n)
           end2 (+ start2 n)))
   ;; Check for overlapping sequences.
-  (when (and (eql sequence-1 sequence-2)
-             (or (and (<= start1 start2) (< start2 end1))
-                 (and (< start1 end2) (<= end2 end1))
-                 (and (<= start2 start1) (< start1 end2))
-                 (and (< start2 end1) (<= end1 end2))))
-    (when (eql start1 start2)
-      (return-from replace sequence-1))
-    (setf sequence-2 (subseq sequence-2 start2 end2)
-          end2 (- end2 start2)
-          start2 0))
-  (macrolet ((fast-vector (type)
-               `(if (and (typep sequence-1 '(array ,type (*)))
-                         (not (array-displacement sequence-1))
-                         (typep sequence-2 '(array ,type (*)))
-                         (not (array-displacement sequence-2)))
-                    (let ((simple-vector-1 (if (typep sequence-1 '(simple-array ,type (*)))
-                                               sequence-1
-                                               (sys.int::%complex-array-storage sequence-1)))
-                          (simple-vector-2 (if (typep sequence-2 '(simple-array ,type (*)))
-                                               sequence-2
-                                               (sys.int::%complex-array-storage sequence-2))))
-                      (declare (type (simple-array ,type (*)) simple-vector-1 simple-vector-2)
-                               (type fixnum start1 end1 start2 end2)
-                               (optimize speed (safety 0)))
-                      (loop
-                         for i fixnum below (min (the fixnum (- end1 start1)) (the fixnum (- end2 start2)))
-                         do
-                           (setf (aref simple-vector-1 (the fixnum (+ start1 i)))
-                                 (aref simple-vector-2 (the fixnum (+ start2 i)))))
-                      t)
-                    nil)))
-    (cond ((fast-vector (unsigned-byte 8)))
-          ((fast-vector (unsigned-byte 16)))
-          ((fast-vector (unsigned-byte 32)))
-          ((fast-vector (unsigned-byte 64)))
-          ((fast-vector (signed-byte 8)))
-          ((fast-vector (signed-byte 16)))
-          ((fast-vector (signed-byte 32)))
-          ((fast-vector (signed-byte 64)))
-          ((fast-vector t))
-          ((fast-vector single-float))
-          ((fast-vector double-float))
-          (t
-           (dotimes (i (min (- end1 start1) (- end2 start2)))
-             (setf (elt sequence-1 (+ start1 i)) (elt sequence-2 (+ start2 i)))))))
+  (let ((copy-backwards nil))
+    (when (and (eql sequence-1 sequence-2)
+               ;; Only matters if source is before dest.
+               (<= start2 start1)
+               (or (and (<= start1 start2) (< start2 end1))
+                   (and (< start1 end2) (<= end2 end1))
+                   (and (<= start2 start1) (< start1 end2))
+                   (and (< start2 end1) (<= end1 end2))))
+      (when (eql start1 start2)
+        (return-from replace sequence-1))
+      (setf copy-backwards t))
+    (macrolet ((fast-vector (type)
+                 `(if (and (typep sequence-1 '(array ,type (*)))
+                           (not (array-displacement sequence-1))
+                           (typep sequence-2 '(array ,type (*)))
+                           (not (array-displacement sequence-2)))
+                      (let ((simple-vector-1 (if (typep sequence-1 '(simple-array ,type (*)))
+                                                 sequence-1
+                                                 (sys.int::%complex-array-storage sequence-1)))
+                            (simple-vector-2 (if (typep sequence-2 '(simple-array ,type (*)))
+                                                 sequence-2
+                                                 (sys.int::%complex-array-storage sequence-2))))
+                        (declare (type (simple-array ,type (*)) simple-vector-1 simple-vector-2)
+                                 (type fixnum start1 end1 start2 end2)
+                                 (optimize speed (safety 0)))
+                        (cond (copy-backwards
+                               (loop
+                                  with n = (min (the fixnum (- end1 start1)) (the fixnum (- end2 start2)))
+                                  with origin1 fixnum = (1- (+ start1 n))
+                                  with origin2 fixnum = (1- (+ start2 n))
+                                  for i fixnum below n
+                                  do
+                                    (setf (aref simple-vector-1 (the fixnum (- origin1 i)))
+                                          (aref simple-vector-2 (the fixnum (- origin2 i))))))
+                              (t
+                               (loop
+                                  for i fixnum below (min (the fixnum (- end1 start1)) (the fixnum (- end2 start2)))
+                                  do
+                                    (setf (aref simple-vector-1 (the fixnum (+ start1 i)))
+                                          (aref simple-vector-2 (the fixnum (+ start2 i)))))))
+                        t)
+                      nil)))
+      (cond ((fast-vector (unsigned-byte 8)))
+            ((fast-vector (unsigned-byte 16)))
+            ((fast-vector (unsigned-byte 32)))
+            ((fast-vector (unsigned-byte 64)))
+            ((fast-vector (signed-byte 8)))
+            ((fast-vector (signed-byte 16)))
+            ((fast-vector (signed-byte 32)))
+            ((fast-vector (signed-byte 64)))
+            ((fast-vector t))
+            ((fast-vector single-float))
+            ((fast-vector double-float))
+            (t
+             (let ((n (min (- end1 start1) (- end2 start2))))
+               (cond (copy-backwards
+                      (dotimes (i n)
+                        (setf (elt sequence-1 (- (+ start1 n) i 1)) (elt sequence-2 (- (+ start2 n) i 1)))))
+                     (t
+                      (dotimes (i n)
+                        (setf (elt sequence-1 (+ start1 i)) (elt sequence-2 (+ start2 i)))))))))))
   sequence-1)
 
+(defmacro object-type-dispatch (object &body body)
+  "Fast CASE on (%OBJECT-TAG object)"
+  (let ((object-tags (make-array 64 :initial-element nil))
+        (targets '())
+        (default-form nil)
+        (default-target (gensym))
+        (block-name (gensym)))
+    (loop
+       for (keys . forms) in body
+       for sym = (gensym)
+       do
+         (cond ((eql keys t)
+                (when default-form
+                  (error "Duplicate default forms"))
+                (setf default-form `(return-from ,block-name (progn ,@forms))))
+               (t
+                (when (not (listp keys))
+                  (setf keys (list keys)))
+                (dolist (key keys)
+                  (assert (<= 0 key 64))
+                  (when (aref object-tags key)
+                    (error "Duplicate key ~S~%" key))
+                  (setf (aref object-tags key) sym))
+                (push sym targets)
+                (push `(return-from ,block-name (progn ,@forms)) targets))))
+    `(block ,block-name
+       (tagbody
+          (%jump-table (%object-tag ,object)
+                       ,@(loop
+                            for target across object-tags
+                            collect `(go ,(or target default-target))))
+          ,@(reverse targets)
+          ,default-target
+          ,default-form))))
+
+(defun fill-known-args (sequence item start end)
+  (check-type start (integer 0))
+  (prog ((original-sequence sequence))
+     (when (not (%value-has-tag-p sequence +tag-object+))
+       (go NOT-OBJECT))
+     RETRY-COMPLEX-ARRAY
+     (macrolet ((fast-vector-fill (type)
+                  `(progn
+                     (check-type item ,type)
+                     (locally
+                         (declare (type (simple-array ,type (*)) sequence)
+                                  (type ,type item)
+                                  (optimize speed (safety 0) (debug 1)))
+                       (cond (end
+                              (assert (<= start end))
+                              (assert (<= end (length sequence))))
+                             (t
+                              (assert (<= start (length sequence)))
+                              (setf end (length sequence))))
+                       (locally
+                           (declare (type fixnum start end))
+                         (loop
+                            for i fixnum below (the fixnum (- end start))
+                            do
+                              (setf (aref sequence (the fixnum (+ start i))) item)))))))
+       (object-type-dispatch sequence
+         (#.+object-tag-array-t+ (fast-vector-fill t))
+         (#.+object-tag-array-unsigned-byte-8+ (fast-vector-fill (unsigned-byte 8)))
+         (#.+object-tag-array-unsigned-byte-16+ (fast-vector-fill (unsigned-byte 16)))
+         (#.+object-tag-array-unsigned-byte-32+ (fast-vector-fill (unsigned-byte 32)))
+         (#.+object-tag-array-unsigned-byte-64+ (fast-vector-fill (unsigned-byte 64)))
+         (#.+object-tag-array-signed-byte-8+ (fast-vector-fill (signed-byte 8)))
+         (#.+object-tag-array-signed-byte-16+ (fast-vector-fill (signed-byte 16)))
+         (#.+object-tag-array-signed-byte-32+ (fast-vector-fill (signed-byte 32)))
+         (#.+object-tag-array-signed-byte-64+ (fast-vector-fill (signed-byte 64)))
+         (#.+object-tag-array-single-float+ (fast-vector-fill single-float))
+         (#.+object-tag-array-double-float+ (fast-vector-fill double-float))
+         ((#.+object-tag-simple-array+ #.+object-tag-array+)
+          (when (not (eql (array-rank sequence) 1))
+            (error 'type-error :datum sequence :expected-type 'sequence))
+          (when (array-displacement sequence)
+            (go GENERIC))
+          ;; 1D non-displaced array. Adjustable or has a fill-pointer.
+          (when (array-has-fill-pointer-p sequence)
+            (cond (end
+                   (assert (<= end (fill-pointer sequence))))
+                  (t
+                   (setf end (fill-pointer sequence)))))
+          (setf sequence (sys.int::%complex-array-storage sequence))
+          (go RETRY-COMPLEX-ARRAY))
+         ;; TODO: Strings. Check item is a character, expand underlying array as required, fill underlying array with char-as-int.
+         (t
+          (go GENERIC))))
+     (return original-sequence)
+     NOT-OBJECT
+     (when (not (consp sequence))
+       (error 'type-error :datum sequence :expected-type 'sequence))
+     GENERIC
+     (when (not end)
+       (setf end (length sequence)))
+     (assert (<= 0 start end (length sequence)))
+     (dotimes (i (- end start))
+       (setf (elt sequence (+ i start)) item))
+     (return original-sequence)))
+
+;; Avoid keyword argument setup.
 (declaim (inline fill))
 (defun fill (sequence item &key (start 0) end)
-  (etypecase sequence
-    (list
-     (let ((end (or end (length sequence))))
-       (dotimes (i (- end start))
-         (setf (elt sequence (+ i start)) item))))
-    (vector
-     (let ((end (or end (length sequence))))
-       (dotimes (i (- end start))
-         (setf (aref sequence (+ i start)) item)))))
-  sequence)
+  (fill-known-args sequence item start end))
+
+(define-compiler-macro map (&whole whole result-type function first-sequence &rest more-sequences)
+  (when (not (or (eql result-type 'nil)
+                 (equal result-type ''nil)))
+    (return-from map whole))
+  (let* ((function-sym (gensym "FUNCTION"))
+         (n-sequences (1+ (length more-sequences)))
+         (seq-vars (loop
+                      repeat n-sequences
+                      collect (gensym)))
+         (n-results (gensym))
+         (iter (gensym)))
+    `(let* ((,function-sym ,function)
+            ,@(loop
+                 for seq in (list* first-sequence more-sequences)
+                 for var in seq-vars
+                 collect (list var seq))
+            (,n-results (min ,@(loop
+                                  for var in seq-vars
+                                  collect `(length ,var)))))
+       (loop
+          for ,iter below ,n-results
+          do (funcall ,function-sym ,@(loop
+                                         for var in seq-vars
+                                         collect `(elt ,var ,iter)))))))
 
 (defun map (result-type function first-sequence &rest more-sequences)
   (let* ((sequences (cons first-sequence more-sequences))
@@ -606,8 +810,7 @@
                  :count count))
 
 (defun substitute (newitem olditem sequence &key test test-not key (start 0) end count) ; from-end
-  (when (and test test-not)
-    (error "Both :TEST and :TEST-NOT specified"))
+  (check-test-test-not test test-not)
   (when test-not (setf test (complement test-not)))
   (unless test (setf test 'eql))
   (substitute-if newitem
@@ -651,8 +854,7 @@
            sequence)))
 
 (defun nsubstitute (newitem olditem sequence &key test test-not key (start 0) end) ; from-end
-  (when (and test test-not)
-    (error "Both :TEST and :TEST-NOT specified"))
+  (check-test-test-not test test-not)
   (when test-not (setf test (complement test-not)))
   (unless test (setf test 'eql))
   (nsubstitute-if newitem
@@ -662,9 +864,12 @@
                  :start start
                  :end end))
 
-(defun reduce (function sequence &key key (initial-value nil initial-valuep) from-end) ; start end
+(defun reduce (function sequence &key key (initial-value nil initial-valuep) from-end (start 0) end)
   (check-type key (or null symbol function))
   (unless key (setf key 'identity))
+  (when (or (not (eql start 0))
+            end)
+    (setf sequence (subseq sequence start end)))
   (when from-end
     (setf sequence (reverse sequence)))
   (cond ((eql (length sequence) 0)
@@ -716,8 +921,6 @@
 
 ;; I sure hope so...
 (setf (fdefinition 'stable-sort) #'sort)
-;; missing function...
-(setf (fdefinition 'delete-duplicates) #'remove-duplicates)
 
 (defun make-sequence (result-type size &key (initial-element nil initial-element-p))
   (cond ((subtypep result-type 'list)
@@ -735,8 +938,8 @@
 (defun search (sequence-1 sequence-2 &key from-end test test-not key (start1 0) (start2 0) end1 end2)
   (setf end1 (or end1 (length sequence-1)))
   (setf end2 (or end2 (length sequence-2)))
+  (check-test-test-not test test-not)
   (when test-not
-    (when test (error ":TEST and :TEST-NOT specified."))
     (setf test (complement test-not)))
   (setf test (or test #'eql))
   (setf key (or key #'identity))
@@ -757,8 +960,7 @@
             (return index2)))))
 
 (defun mismatch (sequence-1 sequence-2 &key from-end test test-not key (start1 0) (start2 0) end1 end2)
-  (when (and test test-not)
-    (error ":TEST and :TEST-NOT specified"))
+  (check-test-test-not test test-not)
   (when test-not
     (setf test (complement test-not)))
   (setf test (or test #'eql))

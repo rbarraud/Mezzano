@@ -196,26 +196,23 @@ If clear, the fault occured in supervisor mode.")
           ((not (logtest #x200 (interrupt-frame-raw-register interrupt-frame :rflags)))
            ;; IRQs must be enabled when a page fault occurs.
            (fatal-page-fault interrupt-frame info "Page fault with interrupts disabled" fault-addr))
-          ((or (<= 0 fault-addr (1- (* 2 1024 1024 1024)))
+          ((or (<= 0 fault-addr (1- (* 512 1024 1024 1024)))
                (<= (ash sys.int::+address-tag-stack+ sys.int::+address-tag-shift+)
                    fault-addr
                    (+ (ash sys.int::+address-tag-stack+ sys.int::+address-tag-shift+)
                       (* 512 1024 1024 1024))))
-           ;; Pages below 2G are wired and should never be unmapped or protected.
+           ;; Pages below 512G are wired and should never be unmapped or protected.
            ;; Same for pages in the wired stack area.
            (fatal-page-fault interrupt-frame info "Page fault in wired area" fault-addr))
-          ((and (logbitp +page-fault-error-present+ info)
-                (logbitp +page-fault-error-write+ info))
-           ;; Copy on write page, might not return.
-           (snapshot-clone-cow-page-via-page-fault interrupt-frame fault-addr))
           ;; All impossible.
-          ((or (logbitp +page-fault-error-present+ info)
-               (logbitp +page-fault-error-user+ info)
+          ((or (logbitp +page-fault-error-user+ info)
                (logbitp +page-fault-error-reserved-violation+ info))
            (fatal-page-fault interrupt-frame info "Page fault" fault-addr))
-          (t ;; Non-present page. Try to load it from the store.
+          (t ;; Defer to the pager.
            ;; Might not return.
-           (wait-for-page-via-interrupt interrupt-frame fault-addr)))))
+           (wait-for-page-via-interrupt interrupt-frame
+                                        fault-addr
+                                        (logbitp +page-fault-error-write+ info))))))
 
 (defun sys.int::%math-fault-handler (interrupt-frame info)
   (unhandled-interrupt interrupt-frame info "math fault"))
@@ -245,12 +242,11 @@ If clear, the fault occured in supervisor mode.")
   "Caches the current IRQ mask, so it doesn't need to be read from the PIC when being modified.")
 (sys.int::defglobal *i8259-spinlock* nil
   "Lock serializing access to i8259 and associated variables.")
-(sys.int::defglobal *i8259-handlers* nil)
+(sys.int::defglobal *i8259-irqs* nil)
 
 (defun i8259-interrupt-handler (interrupt-frame info)
   (let ((irq (- info +i8259-base-interrupt+)))
-    (dolist (handler (svref *i8259-handlers* irq))
-      (funcall handler interrupt-frame irq))
+    (irq-deliver interrupt-frame (svref *i8259-irqs* irq))
     ;; Send EOI.
     (with-symbol-spinlock (*i8259-spinlock*)
       (setf (sys.int::io-port/8 #x20) #x20)
@@ -280,18 +276,14 @@ If clear, the fault occured in supervisor mode.")
             (setf (sys.int::io-port/8 #x21) (ldb (byte 8 0) *i8259-shadow-mask*))
             (setf (sys.int::io-port/8 #xA1) (ldb (byte 8 8) *i8259-shadow-mask*)))))))
 
-(defun i8259-hook-irq (irq handler)
-  (check-type handler (or function symbol))
-  (push-wired handler (svref *i8259-handlers* irq)))
-
 (defun initialize-i8259 ()
   ;; TODO: do the APIC & IO-APIC as well.
-  (when (not (boundp '*i8259-handlers*))
-    (setf *i8259-handlers* (sys.int::make-simple-vector 16 :wired)
+  (when (not (boundp '*i8259-irqs*))
+    (setf *i8259-irqs* (sys.int::make-simple-vector 16 :wired)
           ;; fixme: do at cold-gen time.
           *i8259-spinlock* :unlocked))
   (dotimes (i 16)
-    (setf (svref *i8259-handlers* i) nil))
+    (setf (svref *i8259-irqs* i) (make-irq :platform-number i)))
   ;; Hook interrupts.
   (dotimes (i 16)
     (hook-user-interrupt (+ +i8259-base-interrupt+ i)
@@ -312,11 +304,23 @@ If clear, the fault occured in supervisor mode.")
   ;; Unmask the cascade IRQ, required for the 2nd chip to function.
   (i8259-unmask-irq 2))
 
+(defun platform-irq (number)
+  (cond ((<= 0 number 15)
+         (svref *i8259-irqs* number))
+        (t nil)))
+
+(defun all-platform-irqs ()
+  (loop
+     for irq across *i8259-irqs*
+     collect irq))
+
+(defun map-platform-irqs (fn)
+  (loop
+     for irq across *i8259-irqs*
+     do (funcall fn irq)))
+
 (defun platform-mask-irq (vector)
   (i8259-mask-irq vector))
 
 (defun platform-unmask-irq (vector)
   (i8259-unmask-irq vector))
-
-(defun platform-attach-irq (vector handler)
-  (i8259-hook-irq vector handler))

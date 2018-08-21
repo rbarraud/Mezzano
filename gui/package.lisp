@@ -46,6 +46,7 @@
            #:window-buffer
            #:width
            #:height
+           #:event
            #:key-event
            #:key-scancode
            #:key-releasep
@@ -74,6 +75,8 @@
            #:resize-event
            #:resize-origin
            #:resize-window
+           #:move-event
+           #:move-window
            #:set-window-data
            #:grab-cursor
            #:make-mouse-cursor
@@ -83,7 +86,11 @@
            #:unsubscribe-notification
            #:get-window-by-kind
            #:screen-geometry-update
-           #:force-redisplay))
+           #:force-redisplay
+           #:window-x
+           #:window-y
+           #:*screensaver-spawn-function*
+           #:*screensaver-time*))
 
 (defpackage :mezzano.gui.input-drivers
   (:use :cl))

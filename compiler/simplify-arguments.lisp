@@ -7,8 +7,9 @@
   "Simplify lambda lists so that no lambda argument is special and
 so that no &OPTIONAL argument has a non-constant init-form.
 Must be run after keywords have been lowered."
-  (lower-arguments-1 form)
-  form)
+  (with-metering (:lower-arguments)
+    (lower-arguments-1 form)
+    form))
 
 (defgeneric lower-arguments-1 (form))
 
@@ -108,7 +109,9 @@ Must be run after keywords have been lowered."
                                                 (new-var (string (name suppliedp))))
                                                (lexical-variable
                                                 suppliedp)))
-                              (trivial-init-form (typep init-form 'ast-quote))
+                              (trivial-init-form (and (typep init-form 'ast-quote)
+                                                      (or (not *use-new-compiler*)
+                                                          (eql (ast-value init-form) nil))))
                               (new-arg (etypecase arg
                                          (special-variable
                                           (new-var (string (name arg))))

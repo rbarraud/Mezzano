@@ -8,9 +8,11 @@
 
 (defvar *rename-list*)
 
-(defun value-aware-lowering (lambda)
-  (let ((*rename-list* '()))
-    (value-aware-lowering-1 lambda :single)))
+(defun value-aware-lowering (lambda architecture)
+  (declare (ignore architecture))
+  (with-metering (:value-aware-lowering)
+    (let ((*rename-list* '()))
+      (value-aware-lowering-1 lambda :single))))
 
 (defgeneric value-aware-lowering-1 (form mode))
 
@@ -72,7 +74,33 @@
   (declare (ignore mode))
   (setf (function-form form) (value-aware-lowering-1 (function-form form) :single)
         (value-form form) (value-aware-lowering-1 (value-form form) :multiple))
-  form)
+  (cond ((and (typep (value-form form) 'ast-call)
+              (eql (ast-name (value-form form)) 'values))
+         ;; Replace this with funcall.
+         (change-made)
+         (ast `(call mezzano.runtime::%funcall
+                     ,(function-form form)
+                     ,@(ast-arguments (value-form form)))
+              form))
+        ((and (typep (value-form form) 'ast-call)
+              (eql (ast-name (value-form form)) 'values-list)
+              (eql (length (ast-arguments (value-form form))) 1))
+         ;; Replace this with apply.
+         (change-made)
+         (ast `(call mezzano.runtime::%apply
+                     ,(function-form form)
+                     ,(first (ast-arguments (value-form form))))
+              form))
+        ((or (typep (value-form form) 'ast-quote)
+             (typep (value-form form) 'lexical-variable))
+         ;; Replace this with funcall.
+         (change-made)
+         (ast `(call mezzano.runtime::%funcall
+                     ,(function-form form)
+                     ,(value-form form))
+              form))
+        (t
+         form)))
 
 (defmethod value-aware-lowering-1 ((form ast-multiple-value-prog1) mode)
   (ecase mode
@@ -140,15 +168,20 @@
   form)
 
 (defmethod value-aware-lowering-1 ((form ast-the) mode)
-  (setf (value form) (value-aware-lowering-1 (value form) mode))
-  form)
+  (ecase mode
+    (:effect
+     (change-made)
+     (value-aware-lowering-1 (value form) mode))
+    ((:single :multiple)
+     (setf (value form) (value-aware-lowering-1 (value form) mode))
+     form)))
 
 (defmethod value-aware-lowering-1 ((form ast-unwind-protect) mode)
   (setf (protected-form form) (value-aware-lowering-1 (protected-form form) mode)
         (cleanup-function form) (value-aware-lowering-1 (cleanup-function form) :single))
   form)
 
-(defparameter *pure-functions* '(consp sys.int::fixnump))
+(defparameter *pure-functions* '(consp sys.int::fixnump cons list list* copy-list))
 
 (defmethod value-aware-lowering-1 ((form ast-call) mode)
   (cond ((and (eql (name form) 'values)

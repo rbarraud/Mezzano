@@ -1,5 +1,8 @@
 (in-package :cl-user)
 
+(require :nibbles)
+(require :alexandria)
+
 (defun read-image-header (stream offset)
   (let ((header (make-array 4096 :element-type '(unsigned-byte 8))))
     (file-position stream offset)
@@ -15,7 +18,7 @@
   (let ((major (nibbles:ub16ref/le header 32))
         (minor (nibbles:ub16ref/le header 34)))
     (when (not (and (eql major 0)
-                    (eql minor 23)))
+                    (eql minor 24)))
       (error "Image has unsupported protocol version ~D.~D.~%" major minor))
     (let* ((uuid (subseq header 16 32))
            (entry-fref (nibbles:ub64ref/le header 40))
@@ -65,15 +68,17 @@
            (let ((presentp (logbitp 0 entry))
                  (writep (logbitp 1 entry))
                  (zero-fill-p (logbitp 2 entry))
-                 (wiredp (logbitp 4 entry)))
-             (assert (zerop (logand entry (lognot #x3FFFFFFFFFFFFF17))))
+                 (wiredp (logbitp 4 entry))
+                 (dirty-trackp (logbitp 5 entry)))
+             (assert (zerop (logand entry (lognot #x3FFFFFFFFFFFFF37))))
              (when (eql block-id (1- (ash 1 54)))
                (setf block-id :lazy))
              (list :block-id block-id
                    :presentp presentp
                    :writep writep
                    :zero-fill-p zero-fill-p
-                   :wiredp wiredp))))))
+                   :wiredp wiredp
+                   :dirty-trackp dirty-trackp))))))
 
 (defun read-block-map (stream offset bml4-block)
   (let ((block-map (make-hash-table)))
@@ -118,6 +123,9 @@
                        #b00000000)
                    (if (getf info :wiredp)
                        #b00010000
+                       #b00000000)
+                   (if (getf info :dirty-trackp)
+                       #b00100000
                        #b00000000))))
         (t
          0)))
@@ -181,7 +189,54 @@
     (write-sequence table output-stream)
     bml4-block))
 
-(defun flatten-image-stream (input-stream output-stream &key (input-offset 0) (output-offset 0) output-uuid)
+(defun generate-uuid ()
+  (let ((uuid (make-array 16 :element-type '(unsigned-byte 8))))
+    (dotimes (i 16)
+      (setf (aref uuid i) (case i
+                            (9 (logior #x40 (random 16)))
+                            (7 (logior (random 64) #x80))
+                            (t (random 256)))))
+    uuid))
+
+(defun format-uuid (stream object &optional colon-p at-sign-p)
+  (declare (ignore colon-p at-sign-p))
+  ;; Printed UUIDs are super weird.
+  (format stream "~2,'0X~2,'0X~2,'0X~2,'0X-~2,'0X~2,'0X-~2,'0X~2,'0X-~2,'0X~2,'0X-~2,'0X~2,'0X~2,'0X~2,'0X~2,'0X~2,'0X"
+          ;; Byteswapped.
+          (aref object 3) (aref object 2) (aref object 1) (aref object 0)
+          (aref object 5) (aref object 4)
+          (aref object 7) (aref object 6)
+          ;; Not byteswapped.
+          (aref object 8) (aref object 9)
+          (aref object 10) (aref object 11) (aref object 12) (aref object 13) (aref object 14) (aref object 15)))
+
+(defun parse-uuid (string)
+  (assert (eql (length string) 36))
+  (assert (eql (char string 8) #\-))
+  (assert (eql (char string 13) #\-))
+  (assert (eql (char string 18) #\-))
+  (assert (eql (char string 23) #\-))
+  (flet ((b (start)
+           (parse-integer string :radix 16 :start start :end (+ start 2))))
+    (vector
+     ;; First group. Byteswapped.
+     (b 6) (b 4) (b 2) (b 0)
+     ;; Second group. Byteswapped.
+     (b 11) (b 9)
+     ;; Third group. Byteswapped.
+     (b 16) (b 14)
+     ;; Fourth group. Not byteswapped.
+     (b 19) (b 21)
+     ;; Fifth group. Not byteswapped.
+     (b 24) (b 26) (b 28) (b 30) (b 32) (b 34))))
+
+(defun load-image-header (path)
+  (with-open-file (s path :direction :input :element-type '(unsigned-byte 8))
+    (let ((data (make-array (file-length s) :element-type '(unsigned-byte 8))))
+      (read-sequence data s)
+      data)))
+
+(defun flatten-image-stream (input-stream output-stream &key (input-offset 0) output-offset output-uuid header-path output-size)
   (let* ((input-header (decode-image-header (read-image-header input-stream input-offset)))
          (block-map (read-block-map input-stream input-offset (getf input-header :bml4)))
          (output-block-map (make-hash-table))
@@ -189,7 +244,22 @@
          (sorted-blocks (sort (alexandria:hash-table-alist block-map) #'<
                               :key #'first))
          (output-bml4 nil)
-         (output-freelist-block nil))
+         (output-freelist-block nil)
+         (image-header-data (when header-path
+                              (load-image-header header-path))))
+    (when (not output-offset)
+      (setf output-offset (if image-header-data
+                              (length image-header-data)
+                              0)))
+    (when image-header-data
+      (when (not output-size)
+        (setf output-size (* 512 1024 1024)))
+      (write-sequence image-header-data output-stream)
+      ;; Update the size of the third partition entry, the Mezzano partiton.
+      (file-position output-stream #x1EA)
+      (nibbles:write-ub32/le (truncate (- output-size output-offset) 512) output-stream)
+      (file-position output-stream (1- output-size))
+      (write-byte 0 output-stream))
     ;; Copy blocks from the input to the output.
     (file-position output-stream (+ output-offset 4096))
     (loop
@@ -214,9 +284,9 @@
     ;; Generate a new header.
     (let ((output-header (copy-list input-header)))
       (cond ((null output-uuid)
-             (setf (getf output-header :uuid) (cold-generator::generate-uuid)))
+             (setf (getf output-header :uuid) (generate-uuid)))
             ((stringp output-uuid)
-             (setf (getf output-header :uuid) (cold-generator::parse-uuid output-uuid)))
+             (setf (getf output-header :uuid) (parse-uuid output-uuid)))
             ((not (eql output-uuid t))
              (setf (getf output-header :uuid) output-uuid)))
       (setf (getf output-header :bml4) output-bml4

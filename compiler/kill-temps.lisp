@@ -12,8 +12,11 @@
 ;;; VALUES prevents additional values from leaking without any impact on the
 ;;; generated code.
 
-(defun kill-temporaries (lambda)
-  (kt-form lambda))
+(defun kill-temporaries (lambda architecture)
+  (declare (ignore architecture))
+  (with-metering (:kill-temporaries)
+    (detect-uses lambda)
+    (kt-form lambda)))
 
 (defgeneric kt-form (form &optional target-variable replacement-form))
 

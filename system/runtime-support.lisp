@@ -91,26 +91,33 @@
     (values (get sym mode-name)
             (get sym form-name))))
 
-;;; Turn (APPLY fn arg) into (%APPLY fn arg), bypassing APPLY's
-;;; rest-list generation in the single arg case.
+;;; Turn (APPLY fn args...) into (%APPLY fn (list* args...)), bypassing APPLY's
+;;; rest-list generation.
 (define-compiler-macro apply (&whole whole function arg &rest more-args)
   (if more-args
-      `(mezzano.runtime::%apply (%coerce-to-callable ,function)
-                                (list* ,arg ,@more-args))
+      (let ((function-sym (gensym))
+            (args-sym (gensym)))
+        `(let ((,function-sym ,function)
+               (,args-sym (list* ,arg ,@more-args)))
+           (declare (dynamic-extent ,args-sym))
+           (mezzano.runtime::%apply (%coerce-to-callable ,function-sym) ,args-sym)))
       `(mezzano.runtime::%apply (%coerce-to-callable ,function) ,arg)))
 
 (defun apply (function arg &rest more-args)
   (declare (dynamic-extent more-args))
   (check-type function (or function symbol) "a function-designator")
   (when (symbolp function)
-    (setf function (symbol-function function)))
+    (setf function (%coerce-to-callable function)))
   (cond (more-args
          ;; Convert (... (final-list ...)) to (... final-list...)
+         ;; This modifies the dx more-args rest list, but that's ok as apply
+         ;; isn't inlined so it will never share structure with an existing list.
          (do* ((arg-list (cons arg more-args))
                (i arg-list (cdr i)))
               ((null (cddr i))
                (setf (cdr i) (cadr i))
-               (mezzano.runtime::%apply function arg-list))))
+               (mezzano.runtime::%apply function arg-list))
+           (declare (dynamic-extent arg-list))))
         (t (mezzano.runtime::%apply function arg))))
 
 (defun funcall (function &rest arguments)
@@ -163,24 +170,22 @@
           (values (second name) '%setf-compiler-macro-function))
     (setf (get sym indicator) value)))
 
-(define-compiler-macro list (&rest args)
-  (cond
-    ((null args) 'nil)
-    (t `(cons ,(first args) (list ,@(rest args))))))
-
 (defun list (&rest args)
   args)
 
 (defun copy-list-in-area (list &optional area)
   (check-type list list)
-  (do* ((result (cons nil nil))
-        (tail result)
-        (l list (cdr l)))
-       ((not (consp l))
-        (setf (cdr tail) l)
-        (cdr result))
-    (setf (cdr tail) (cons-in-area (car l) nil area)
-          tail (cdr tail))))
+  (cond (list
+         (do* ((result (cons-in-area nil nil area))
+               (tail result)
+               (l list (cdr l)))
+              ((not (consp l))
+               (setf (cdr tail) l)
+               (cdr result))
+           (setf (cdr tail) (cons-in-area (car l) nil area)
+                 tail (cdr tail))))
+        (t
+         nil)))
 
 (defun copy-list (list)
   (copy-list-in-area list))
@@ -220,7 +225,7 @@
   name)
 
 (defun %defstruct (structure-type)
-  (setf (get (structure-name structure-type) 'structure-type) structure-type))
+  (setf (gethash (structure-name structure-type) mezzano.runtime::*structure-types*) structure-type))
 
 (defparameter *incompatible-constant-redefinition-is-an-error* nil)
 (defparameter *defconstant-redefinition-comparator* 'eql)
@@ -251,6 +256,9 @@
   '(or
     symbol
     (cons (member setf cas) (cons symbol null))))
+
+(defglobal *setf-fref-table*)
+(defglobal *cas-fref-table*)
 
 (defun make-function-reference (name)
   (let ((fref (mezzano.runtime::%allocate-object +object-tag-function-reference+ 0 4 :wired)))
@@ -287,19 +295,19 @@
                (if successp
                    new-fref
                    old-value)))))
-      ;; FIXME: lock here. It's hard to lock a plist, need to switch to
-      ;; a hash-table or something like that.
       (setf
-       (let ((fref (get name-root 'setf-fref)))
+       (let ((fref (gethash name-root *setf-fref-table*)))
          (unless fref
-           (setf fref (make-function-reference name)
-                 (get name-root 'setf-fref) fref))
+           (let ((new-fref (make-function-reference name)))
+             (setf fref (or (cas (gethash name-root *setf-fref-table*) nil new-fref)
+                            new-fref))))
          fref))
       (cas
-       (let ((fref (get name-root 'cas-fref)))
+       (let ((fref (gethash name-root *cas-fref-table*)))
          (unless fref
-           (setf fref (make-function-reference name)
-                 (get name-root 'cas-fref) fref))
+           (let ((new-fref (make-function-reference name)))
+             (setf fref (or (cas (gethash name-root *cas-fref-table*) nil new-fref)
+                            new-fref))))
          fref)))))
 
 (defun function-reference-p (object)
@@ -355,19 +363,47 @@ VALUE may be nil to make the fref unbound."
   value)
 
 (defun fdefinition (name)
-  (or (function-reference-function (function-reference name))
-      (error 'undefined-function :name name)))
+  (let ((fn (function-reference-function (function-reference name))))
+    (when (not fn)
+      (error 'undefined-function :name name))
+    ;; Hide trace wrappers. Makes defining methods on traced generic functions work.
+    ;; FIXME: Doesn't match the behaviour of FUNCTION.
+    (when (and (funcallable-std-instance-p fn) ; Avoid typep in the usual case.
+               (locally
+                   (declare (notinline typep)) ; bootstrap hack.
+                 (typep fn 'trace-wrapper)))
+      (setf fn (trace-wrapper-original fn)))
+    fn))
 
 (defun (setf fdefinition) (value name)
   (check-type value function)
-  (setf (function-reference-function (function-reference name)) value))
+  ;; Check for and update any existing TRACE-WRAPPER.
+  ;; This is not very thread-safe, but if the user is tracing it shouldn't matter much.
+  (let* ((fref (function-reference name))
+         (existing (function-reference-function fref)))
+    (when (locally
+              (declare (notinline typep)) ; bootstrap hack.
+            (typep existing 'trace-wrapper))
+      ;; Update the traced function instead of setting the fref's function.
+      (setf (trace-wrapper-original existing) value)
+      (return-from fdefinition value))
+    (setf (function-reference-function fref) value)))
 
 (defun fboundp (name)
   (not (null (function-reference-function (function-reference name)))))
 
 (defun fmakunbound (name)
-  (setf (function-reference-function (function-reference name)) nil)
-  name)
+  ;; Check for and update any existing TRACE-WRAPPER.
+  ;; This is not very thread-safe, but if the user is tracing it shouldn't matter much.
+  (let* ((fref (function-reference name))
+         (existing (function-reference-function fref)))
+    (when (locally
+              (declare (notinline typep)) ; bootstrap hack.
+            (typep existing 'trace-wrapper))
+      ;; Untrace the function.
+      (%untrace (function-reference-name fref)))
+    (setf (function-reference-function (function-reference name)) nil)
+    name))
 
 (defun symbol-function (symbol)
   (check-type symbol symbol)
@@ -377,17 +413,34 @@ VALUE may be nil to make the fref unbound."
   (check-type symbol symbol)
   (setf (fdefinition symbol) value))
 
+(defun gensym-1 (prefix number)
+  (let ((name (make-array (length prefix)
+                          :element-type 'character
+                          :initial-contents prefix
+                          :adjustable t
+                          :fill-pointer t)))
+    ;; Open-code integer to string conversion.
+    (labels ((frob (value)
+               (multiple-value-bind (quot rem)
+                   (truncate value 10)
+                 (when (not (zerop quot))
+                   (frob quot))
+                 (vector-push-extend (code-char (+ 48 rem))
+                                     name))))
+      (if (zerop number)
+          (vector-push-extend #\0 name)
+          (frob number)))
+    (make-symbol name)))
+
 (defvar *gensym-counter* 0)
 (defun gensym (&optional (thing "G"))
-  (check-type thing (or string (integer 0)))
-  (if (integerp thing)
-      (make-symbol (with-output-to-string (s)
-                     (write-char #\G s)
-                     (write thing :stream s :base 10)))
-      (prog1 (make-symbol (with-output-to-string (s)
-                            (write-string thing s)
-                            (write *gensym-counter* :stream s :base 10)))
-        (incf *gensym-counter*))))
+  (etypecase thing
+    ((integer 0)
+     (gensym-1 "G" thing))
+    (string
+     (prog1
+         (gensym-1 thing *gensym-counter*)
+       (incf *gensym-counter*)))))
 
 ;;; TODO: Expand this so it knows about the compiler's constant folders.
 (defun constantp (form &optional environment)
@@ -398,7 +451,7 @@ VALUE may be nil to make the fref unbound."
     (t t)))
 
 (defun get-structure-type (name &optional (errorp t))
-  (or (get name 'structure-type)
+  (or (gethash name mezzano.runtime::*structure-types*)
       (and errorp
            (error "Unknown structure type ~S." name))))
 
@@ -447,7 +500,8 @@ VALUE may be nil to make the fref unbound."
                                               (princ-to-string *compile-file-pathname*))
                                             sys.int::*top-level-form-number*
                                             lambda-list
-                                            docstring)
+                                            docstring
+                                            nil)
                                     nil
                                     #+x86-64 :x86-64))
        ',name)))
@@ -462,24 +516,24 @@ VALUE may be nil to make the fref unbound."
 
 (defun std-instance-class (std-instance)
   (%type-check std-instance +object-tag-std-instance+ 'std-instance)
-  (%object-ref-t std-instance 0))
+  (%object-ref-t std-instance +std-instance-class+))
 (defun (setf std-instance-class) (value std-instance)
   (%type-check std-instance +object-tag-std-instance+ 'std-instance)
-  (setf (%object-ref-t std-instance 0) value))
+  (setf (%object-ref-t std-instance +std-instance-class+) value))
 
 (defun std-instance-slots (std-instance)
   (%type-check std-instance +object-tag-std-instance+ 'std-instance)
-  (%object-ref-t std-instance 1))
+  (%object-ref-t std-instance +std-instance-slots+))
 (defun (setf std-instance-slots) (value std-instance)
   (%type-check std-instance +object-tag-std-instance+ 'std-instance)
-  (setf (%object-ref-t std-instance 1) value))
+  (setf (%object-ref-t std-instance +std-instance-slots+) value))
 
 (defun std-instance-layout (std-instance)
   (%type-check std-instance +object-tag-std-instance+ 'std-instance)
-  (%object-ref-t std-instance 2))
+  (%object-ref-t std-instance +std-instance-layout+))
 (defun (setf std-instance-layout) (value std-instance)
   (%type-check std-instance +object-tag-std-instance+ 'std-instance)
-  (setf (%object-ref-t std-instance 2) value))
+  (setf (%object-ref-t std-instance +std-instance-layout+) value))
 
 (macrolet ((def (op)
              `(setf (fdefinition ',op)

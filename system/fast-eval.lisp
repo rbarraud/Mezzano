@@ -54,6 +54,7 @@
     ((eval-when)
      (multiple-value-bind (compile load eval)
          (sys.int::parse-eval-when-situation (second form))
+       (declare (ignore compile load))
        (when eval
          (eval-progn-body (cddr form) env))))
     ((multiple-value-call)
@@ -90,11 +91,25 @@
               (eval-compile form env))
              (t (multiple-value-bind (expansion expanded-p)
                     (macroexpand form env)
-                  (if expanded-p
-                      (eval-in-lexenv expansion env)
-                      (apply (symbol-function (first form))
-                             (mapcar (lambda (f) (eval-in-lexenv f env))
-                                     (rest form))))))))))
+                  (cond (expanded-p
+                         (eval-in-lexenv expansion env))
+                        (t
+                         (eval-call form env)))))))))
+
+(defun eval-call (form env)
+  ;; Don't use FDEFINITION, poke directly in the fref to stop trace wrappers
+  ;; from being hidden.
+  (let ((fn (sys.int::function-reference-function
+             (sys.int::function-reference (first form))))
+        (args (rest form)))
+    (cond (fn
+           (apply fn
+                  (mapcar (lambda (f) (eval-in-lexenv f env))
+                          (rest form))))
+          (t
+           ;; Punt if the function is not bound, take advantage
+           ;; of the restarts set up by the runtime.
+           (eval-compile form env)))))
 
 (defun eval-symbol (form env)
   (let ((expanded (macroexpand form env)))

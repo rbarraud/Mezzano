@@ -55,7 +55,6 @@
                 (setf result (,base result n)))
               result))
           (define-compiler-macro ,name (&rest numbers)
-            (declare (dynamic-extent numbers))
             (cond ((null numbers) ',identity)
                   ((null (rest numbers))
                    `(the number ,(first numbers)))
@@ -91,7 +90,6 @@
         (t (binary-- 0 number))))
 
 (define-compiler-macro - (number &rest more-numbers)
-  (declare (dynamic-extent more-numbers))
   (cond ((null more-numbers) `(binary-- 0 ,number))
         (t (let ((result number))
              (dolist (n more-numbers)
@@ -108,7 +106,6 @@
         (t (binary-/ 1 number))))
 
 (define-compiler-macro / (number &rest more-numbers)
-  (declare (dynamic-extent more-numbers))
   (cond ((null more-numbers) `(binary-/ 1 ,number))
         (t (let ((result number))
              (dolist (n more-numbers)
@@ -435,7 +432,7 @@
   (let ((negativep nil)
         (n 0)
         (whitespace '(#\Space #\Newline #\Tab #\Linefeed #\Page #\Return)))
-    ;; Eat leading/trailing whitespace.
+    ;; Eat leading whitespace.
     (do () ((or (>= start end)
                 (and (not (member (char string start) whitespace)))))
       (incf start))
@@ -461,11 +458,17 @@
              (member (char string offset) whitespace))
          (when negativep
            (setf n (- n)))
-         ;; Eat trailing whitespace
-         (do () ((or (>= offset end)
-                     (and (not (member (char string offset) whitespace)))))
-           (incf offset))
-         (values n offset))
+         (cond (junk-allowed
+                (values n offset))
+               (t
+                ;; All remaining characters must be whitespace.
+                (do () ((>= offset end))
+                  (when (not (member (char string offset) whitespace))
+                    (error 'simple-parse-error
+                           :format-control "Junk after trailing whitespace in ~S."
+                           :format-arguments (list string)))
+                  (incf offset))
+                (values n end))))
       (let ((weight (digit-char-p (char string offset) radix)))
         (when (not weight)
           (if junk-allowed

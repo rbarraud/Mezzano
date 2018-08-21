@@ -25,6 +25,7 @@
 (defgeneric macro-function-in-environment (symbol environment))
 (defgeneric lookup-variable-declared-type-in-environment (symbol environment))
 (defgeneric optimize-qualities-in-environment (environment))
+(defgeneric inline-qualities-in-environment (environment))
 
 ;;; Lexical environments.
 
@@ -90,7 +91,11 @@
       (dolist (func functions)
         (when (not (assoc (first func) new-decls :test #'equal))
           (push (list (first func) nil) new-decls)))
-      (setf (slot-value sub '%inline-decls) (append new-decls (slot-value environment '%inline-decls))))
+      (setf (slot-value sub '%inline-decls) (append new-decls
+                                                    (set-difference (slot-value environment '%inline-decls)
+                                                                    new-decls
+                                                                    :test #'equal
+                                                                    :key #'first))))
     (let ((new-decls '()))
       (flet ((add-decl (name type)
                (let* ((new-var (assoc name variables))
@@ -115,9 +120,16 @@
                  (push (list actual-var real-type) new-decls))))
         (loop
            for (what type . names) in declarations
-           ;; TODO: Pick up (declare (fixnum ...)) and similar.
            when (eql what 'type)
            do (loop for name in names do (add-decl name type)))
+        (loop
+           for (what . names) in declarations
+           when (and (symbolp what)
+                     (or (get what 'sys.int::type-expander)
+                         (get what 'sys.int::compound-type)
+                         (get what 'sys.int::type-symbol)
+                         (get what 'sys.int::maybe-class)))
+           do (loop for name in names do (add-decl name what)))
         (loop
            for (name var) in variables
            when (and (typep var 'lexical-variable)
@@ -216,3 +228,6 @@
 
 (defmethod optimize-qualities-in-environment ((environment lexical-environment))
   (slot-value environment '%optimize))
+
+(defmethod inline-qualities-in-environment ((environment lexical-environment))
+  (slot-value environment '%inline-decls))

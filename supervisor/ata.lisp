@@ -66,6 +66,8 @@
 (defconstant +ata-command-write-sectors-ext+ #x3A)
 (defconstant +ata-command-write-dma+ #xCA)
 (defconstant +ata-command-write-dma-ext+ #x35)
+(defconstant +ata-command-flush-cache+ #xE7)
+(defconstant +ata-command-flush-cache-ext+ #xEA)
 (defconstant +ata-command-identify+ #xEC)
 (defconstant +ata-command-identify-packet+ #xA1)
 (defconstant +ata-command-packet+ #xA0)
@@ -212,6 +214,28 @@ Returns true when the bits are equal, false when the timeout expires or if the d
         (cdrom-initialize-device device cdb-size 'ata-issue-packet-command)
         (setf (atapi-device-initialized-p device) t)))))
 
+(defun read-ata-string (identify-data start end read-fn)
+  (let ((len (* (- end start) 2)))
+    ;; Size the string, can't resize wired strings yet...
+    (loop
+       (when (zerop len)
+         (return))
+       (let* ((word (funcall read-fn identify-data (+ start (ash (1- len) -1))))
+              (byte (if (logtest (1- len) 1)
+                        (ldb (byte 8 0) word)
+                        (ldb (byte 8 8) word))))
+         (when (not (eql byte #x20))
+           (return)))
+       (decf len))
+    (let ((string (mezzano.runtime::make-wired-string len)))
+      (dotimes (i len)
+        (let* ((word (funcall read-fn identify-data (+ start (ash i -1))))
+               (byte (if (logtest i 1)
+                         (ldb (byte 8 0) word)
+                         (ldb (byte 8 8) word))))
+          (setf (char string i) (code-char byte))))
+      string)))
+
 (defun ata-detect-drive (controller channel)
   (let ((buf (sys.int::make-simple-vector 256 :wired)))
     ;; Select the device.
@@ -279,11 +303,27 @@ Returns true when the bits are equal, false when the timeout expires or if the d
                                     :channel channel
                                     :block-size sector-size
                                     :sector-count sector-count
-                                    :lba48-capable lba48-capable)))
+                                    :lba48-capable lba48-capable))
+           (serial-number (read-ata-string buf 10 20 #'svref))
+           (model-number (read-ata-string buf 27 47 #'svref)))
       (debug-print-line "Features (83): " supported-command-sets)
       (debug-print-line "Sector size: " sector-size)
       (debug-print-line "Sector count: " sector-count)
-      (register-disk device t (ata-device-sector-count device) (ata-device-block-size device) 256 'ata-read 'ata-write))))
+      (debug-print-line "Serial: " serial-number)
+      (debug-print-line "Model: " model-number)
+      (register-disk device
+                     t
+                     (ata-device-sector-count device)
+                     (ata-device-block-size device)
+                     256
+                     'ata-read 'ata-write 'ata-flush
+                     (sys.int::cons-in-area
+                      model-number
+                      (sys.int::cons-in-area
+                       serial-number
+                       nil
+                       :wired)
+                      :wired)))))
 
 (defun ata-issue-lba28-command (device lba count command)
   (let ((controller (ata-device-controller device)))
@@ -437,17 +477,18 @@ This is used to implement the INTRQ_Wait state."
 (defun ata-configure-prdt (controller phys-addr n-octets direction)
   (let* ((prdt (ata-controller-prdt-phys controller))
          (prdt-virt (convert-to-pmap-address prdt)))
-    (do ((offset 0))
+    (ensure (<= (+ phys-addr n-octets) #x100000000))
+    (ensure (not (eql n-octets 0)))
+    (do ((offset 0 (+ offset 2)))
         ((<= n-octets #x10000)
          ;; Write final chunk.
          (setf (sys.int::memref-unsigned-byte-32 prdt-virt offset) phys-addr
-               (sys.int::memref-unsigned-byte-32 prdt-virt (1+ offset)) (logior #x80000000
-                                                                                ;; 0 = 64k
-                                                                                (logand n-octets #xFFFF))))
+               (sys.int::memref-unsigned-byte-32 prdt-virt (1+ offset)) (logior #x80000000 n-octets)))
       ;; Write 64k chunks.
       (setf (sys.int::memref-unsigned-byte-32 prdt-virt offset) phys-addr
-            (sys.int::memref-unsigned-byte-32 prdt-virt (1+ offset)) 0)
-      (incf phys-addr #x10000))
+            (sys.int::memref-unsigned-byte-32 prdt-virt (1+ offset)) 0) ; 0 = 64k
+      (incf phys-addr #x10000)
+      (decf n-octets #x10000))
     ;; Write the PRDT location.
     (setf (pci-io-region/32 (ata-controller-bus-master-register controller) +ata-bmr-prdt-address+) prdt
           ;; Clear DMA status. Yup. You have to write 1 to clear bits.
@@ -563,6 +604,35 @@ This is used to implement the INTRQ_Wait state."
 (defun ata-write (device lba count mem-addr)
   (ata-read-write device lba count mem-addr
                   :write #'ata-write-dma #'ata-write-pio))
+
+(defun ata-flush (device)
+  (let ((controller (ata-device-controller device)))
+    (when (not (ata-issue-lba-command device 0 0
+                                      +ata-command-flush-cache+
+                                      +ata-command-flush-cache-ext+))
+      (return-from ata-flush (values nil :device-error)))
+    ;; HND0: INTRQ_Wait
+    (ata-intrq-wait controller)
+    ;; HND1: Check_Status
+    ;; Sample the alt-status register for the required delay.
+    (ata-alt-status controller)
+    (loop
+       with timeout = 60 ; Spec sez flush can take longer than 30 but I can't find an upper bound.
+       do
+         (when (not (logtest (ata-alt-status controller) +ata-bsy+))
+           (return))
+       ;; Stay in Check_Status.
+         (when (<= timeout 0)
+           ;; FIXME: Should reset the device here.
+           (debug-print-line "Device timeout during flush.")
+           (return-from ata-flush (values nil :device-error)))
+         (sleep 0.001)
+         (decf timeout 0.001))
+    ;; Transition to Host_Idle, checking error status.
+    (when (logtest (ata-alt-status controller) +ata-err+)
+      (debug-print-line "Device error " (ata-error controller) " during flush.")
+      (return-from ata-flush (values nil :device-error)))
+    t))
 
 (defun ata-submit-packet-command (device cdb result-len dma dmadir)
   (let* ((controller (atapi-device-controller device))
@@ -728,7 +798,7 @@ This is used to implement the INTRQ_Wait state."
     ;; Disable IRQs on the controller and reset both drives.
     (setf (sys.int::io-port/8 (+ control-base +ata-register-device-control+))
           (logior +ata-srst+ +ata-nien+))
-    (sleep 0.000005) ; Hold SRST high for 5μs.
+    (sleep 0.000005) ; Hold SRST high for 5µs.
     (setf (sys.int::io-port/8 (+ control-base +ata-register-device-control+))
           +ata-nien+)
     (sleep 0.002) ; Hold SRST low for 2ms before probing for drives.
@@ -740,10 +810,13 @@ This is used to implement the INTRQ_Wait state."
       (return-from init-ata-controller))
     (debug-print-line "Probing ata controller.")
     ;; Attach interrupt handler.
-    (i8259-hook-irq irq (lambda (interrupt-frame irq)
-                          (declare (ignore interrupt-frame irq))
-                          (ata-irq-handler controller)))
-    (i8259-unmask-irq irq)
+    (irq-attach irq
+                (lambda (interrupt-frame irq)
+                  (declare (ignore interrupt-frame irq))
+                  (ata-irq-handler controller)
+                  :completed)
+                controller
+                :exclusive t)
     ;; Probe drives.
     (ata-detect-drive controller :master)
     (ata-detect-drive controller :slave)
@@ -765,10 +838,10 @@ This is used to implement the INTRQ_Wait state."
                            +ata-compat-primary-control+
                            (pci-bar location 4)
                            (* prdt-page +4k-page-size+)
-                           +ata-compat-primary-irq+))
+                           (platform-irq +ata-compat-primary-irq+)))
     (when (not (logbitp 2 (pci-programming-interface location)))
       (init-ata-controller +ata-compat-secondary-command+
                            +ata-compat-secondary-control+
                            (+ (pci-bar location 4) 8)
                            (+ (* prdt-page +4k-page-size+) 2048)
-                           +ata-compat-secondary-irq+))))
+                           (platform-irq +ata-compat-secondary-irq+)))))

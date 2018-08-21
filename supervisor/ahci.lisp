@@ -489,6 +489,11 @@
                    +ata-command-write-dma-ext+
                    t))
 
+(defun ahci-flush (port-info)
+  ;; TODO. Should be pretty simple, but I'm not sure if this needs a DMA buffer
+  ;; configured. There's no data being transfered.
+  t)
+
 (defun ahci-detect-atapi-drive (ahci port)
   ;; Issue IDENTIFY PACKET.
   ;; Dump the IDENTIFY PACKET data just after the command table.
@@ -566,7 +571,9 @@
                                      (ash (memref-ub16/le identify-data 102) 32)
                                      (ash (memref-ub16/le identify-data 103) 48))
                              (logior (memref-ub16/le identify-data 60)
-                                     (ash (memref-ub16/le identify-data 61) 16)))))
+                                     (ash (memref-ub16/le identify-data 61) 16))))
+           (serial-number (read-ata-string identify-data 10 20 #'memref-ub16/le))
+           (model-number (read-ata-string identify-data 27 47 #'memref-ub16/le)))
       (setf (ahci-port-lba48-capable port-info) lba48-capable
             (ahci-port-sector-size port-info) sector-size
             (ahci-port-sector-count port-info) sector-count)
@@ -574,7 +581,19 @@
       (debug-print-line "Sector size: " sector-size)
       (debug-print-line "Sector count: " sector-count)
       ;; FIXME: Can transfer more than 256 sectors at once...
-      (register-disk port-info t sector-count sector-size 256 'ahci-read 'ahci-write))))
+      (register-disk port-info
+                     t
+                     sector-count
+                     sector-size
+                     256
+                     'ahci-read 'ahci-write 'ahci-flush
+                     (sys.int::cons-in-area
+                      model-number
+                      (sys.int::cons-in-area
+                       serial-number
+                       nil
+                       :wired)
+                      :wired)))))
 
 (defun (setf ahci-fis) (value ahci port offset)
   "Write an octet into the command FIS for PORT."
@@ -763,7 +782,8 @@
                          :abar (pci-io-region location 5 #x2000))))
     (setf (ahci-irq-handler-function ahci) (lambda (interrupt-frame irq)
                                              (declare (ignore interrupt-frame irq))
-                                             (ahci-irq-handler ahci)))
+                                             (ahci-irq-handler ahci)
+                                             :completed))
     (debug-print-line "Detected AHCI ABAR at " (ahci-abar ahci))
     (debug-print-line "AHCI IRQ is " (pci-intr-line location))
     (ahci-dump-global-registers ahci)
@@ -779,7 +799,9 @@
     (setf (ahci-global-register ahci +ahci-register-GHC+) (ash 1 +ahci-GHC-AE+))
     ;; Attach interrupt handler.
     (debug-print-line "Handler: " (ahci-irq-handler ahci))
-    (i8259-hook-irq (pci-intr-line location) (ahci-irq-handler-function ahci))
+    (irq-attach (platform-irq (pci-intr-line location))
+                (ahci-irq-handler-function ahci)
+                ahci)
     ;; Make sure to enable PCI bus mastering for this device.
     (debug-print-line "Config register: " (pci-config/16 location +pci-config-command+))
     (setf (pci-config/16 location +pci-config-command+) (logior (pci-config/16 location +pci-config-command+)
@@ -804,7 +826,6 @@
     (setf (ahci-global-register ahci +ahci-register-IS+) (ahci-global-register ahci +ahci-register-IS+))
     ;; Now safe to enable HBA interrupts.
     (setf (ldb (byte 1 +ahci-GHC-IE+) (ahci-global-register ahci +ahci-register-GHC+)) 1)
-    (i8259-unmask-irq (pci-intr-line location))
     ;; Initialize devices attached to ports.
     (dotimes (port 32)
       (when (ahci-port ahci port)

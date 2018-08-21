@@ -58,8 +58,8 @@
 (defconstant +object-tag-array-complex-double-float+ #b010101)
 (defconstant +object-tag-array-complex-short-float+  #b010110)
 (defconstant +object-tag-array-complex-long-float+   #b010111)
-(defconstant +object-tag-array-xmm-vector+           #b011000)
-(defconstant +last-simple-1d-array-object-tag+ +object-tag-array-xmm-vector+)
+(defconstant +last-simple-1d-array-object-tag+ +object-tag-array-complex-long-float+)
+;;#b011000
 ;;#b011001
 ;;#b011010
 ;;#b011011
@@ -95,11 +95,11 @@
 ;;#b101100
 ;;#b101101
 ;;#b101110
-;;#b101111
+(defconstant +object-tag-mmx-vector+              #b101111)
 (defconstant +object-tag-symbol+                  #b110000)
 (defconstant +object-tag-structure-object+        #b110001)
 (defconstant +object-tag-std-instance+            #b110010)
-(defconstant +object-tag-xmm-vector+              #b110011)
+(defconstant +object-tag-sse-vector+              #b110011)
 (defconstant +object-tag-thread+                  #b110100)
 (defconstant +object-tag-unbound-value+           #b110101)
 (defconstant +object-tag-function-reference+      #b110110)
@@ -111,13 +111,13 @@
 (defconstant +object-tag-cons+                    #b111000)
 (defconstant +object-tag-freelist-entry+          #b111001)
 (defconstant +object-tag-weak-pointer+            #b111010)
-(defconstant +first-misc-object-tag+ +object-tag-symbol+)
+(defconstant +first-misc-object-tag+ +object-tag-mmx-vector+)
 (defconstant +last-misc-object-tag+ +object-tag-weak-pointer+)
-;;#b111011
+(defconstant +object-tag-delimited-continuation+  #b111011)
 (defconstant +object-tag-function+                #b111100)
 (defconstant +object-tag-closure+                 #b111101)
 (defconstant +object-tag-funcallable-instance+    #b111110)
-(defconstant +first-function-object-tag+ +object-tag-function+)
+(defconstant +first-function-object-tag+ +object-tag-delimited-continuation+)
 (defconstant +last-function-object-tag+ +object-tag-funcallable-instance+)
 ;;#b111111
 
@@ -141,18 +141,12 @@
 (defconstant +symbol-mode-global+ 4)
 
 ;;; Layout of a function's header.
-;;; Currently applies to all 3 function types.
-
+;;; Only applies to compiled functions.
 ;; Machine code size is measured in paragraphs (16 byte units) and starts
 ;; at the beginning of the object, including the header.
-(defconstant +function-machine-code-size+ 16)
-(defconstant +function-machine-code-position+ 8)
-;; Number of entries in the constant pool.
-(defconstant +function-constant-pool-size+ 16)
-(defconstant +function-constant-pool-position+ 24)
-;; Size of the GC metadata in bytes.
-(defconstant +function-gc-metadata-size+ 16)
-(defconstant +function-gc-metadata-position+ 40)
+(defconstant +function-header-code-size+ (byte 16 8))
+(defconstant +function-header-pool-size+ (byte 16 24))
+(defconstant +function-header-metadata-size+ (byte 16 40))
 
 ;;; Layout of functions.
 ;;; Common to all functions.
@@ -173,6 +167,17 @@
 (defconstant +funcallable-instance-class+ 2)
 (defconstant +funcallable-instance-slots+ 3)
 (defconstant +funcallable-instance-layout+ 4)
+
+;;; Delimited continuations.
+(defconstant +delimited-continuation-stack+ 1)
+(defconstant +delimited-continuation-stack-pointer+ 2)
+(defconstant +delimited-continuation-state+ 3)
+(defconstant +delimited-continuation-prompt+ 4)
+
+;;; Standard instances.
+(defconstant +std-instance-class+ 0)
+(defconstant +std-instance-slots+ 1)
+(defconstant +std-instance-layout+ 2)
 
 ;;; Layout of function-references.
 
@@ -209,8 +214,13 @@
 
 (defconstant +address-tag-shift+ 45)
 (defconstant +address-tag-size+ 3)
+(defconstant +address-tag+ (byte +address-tag-size+ +address-tag-shift+))
 
-(defconstant +address-newspace/oldspace-bit+ 44)
+(defconstant +address-generation+ (byte 2 43))
+(defconstant +address-generation-0+ 0)
+(defconstant +address-generation-1+ 1)
+(defconstant +address-generation-2-a+ 2)
+(defconstant +address-generation-2-b+ 3)
 
 ;; Pinned must be zero, a number of critical objects are pinned & wired and stored
 ;; below 2GB to permit fast access to them.
@@ -219,8 +229,34 @@
 (defconstant +address-tag-general+      #b010)
 (defconstant +address-tag-cons+         #b011)
 
+(defconstant +card-size+ #x1000) ; Match page size for now.
+(defconstant +card-table-entry-size+ 4)
+
+(defconstant +card-table-entry-offset+ (byte 16 0)
+  "A negative 16-bit offset from the start of the card to the start
+of the first object in the card. Measured in 16-byte units.
+An offset of all ones (1- (expt 2 16)) indicates that the start of the
+object is further away than what can be encoded and the the system
+should continue looking backwards.")
+(defconstant +cart-table-entry-dirty-gen+ (byte 2 16))
+;; Bits 31-18 available.
+
+;; Cover the whole address space.
+(defconstant +card-table-size+ (* (/ (expt 2 47) +card-size+)
+                                  +card-table-entry-size+))
+(defconstant +card-table-base+ #x4000000000) ; 256GB, mostly arbitrary but in the wired area
+;; VM regions must meet this allocation requirement so that the card table
+;; entries associated with an allocation cover an exact number of pages.
+;; This allows the pager to map/unmap regions in the card table without worrying
+;; about partial page coverage.
+;; NOTE: Stacks don't have card table entries and aren't subject to this
+;; alignment constraint. They must still be page-aligned.
+(defconstant +allocation-minimum-alignment+ (* (/ #x1000 +card-table-entry-size+)
+                                               +card-size+))
+
 (defconstant +block-map-present+ #x01
   "Entry is present. This entry may still have a block associated with it, even if it is not present.")
+;; FIXME: This isn't really respected properly.
 (defconstant +block-map-writable+ #x02
   "Entry is writable.")
 (defconstant +block-map-zero-fill+ #x04
@@ -230,6 +266,9 @@
 Internal to the pager, should not be used by other code.")
 (defconstant +block-map-wired+ #x10
   "Entry should be wired in memory.")
+(defconstant +block-map-track-dirty+ #x20
+  "Dirty bit tracking is enabled for this entry.
+When the page is written to, the corresponding dirty bit in the card table will be set and this flag will be cleared.")
 (defconstant +block-map-flag-mask+ #xFF)
 (defconstant +block-map-id-shift+ 8)
 (defconstant +block-map-id-size+ 54) ; keep it a few bits smaller than 56 to avoid bignums.
@@ -238,7 +277,7 @@ Internal to the pager, should not be used by other code.")
 reserved on the disk, but no specific block has been allocated.")
 (defconstant +block-map-id-not-allocated+ 0)
 
-(defparameter *llf-version* 19)
+(defparameter *llf-version* 23)
 
 (defconstant +llf-arch-x86-64+ 1)
 (defconstant +llf-arch-arm64+ 2)
@@ -357,3 +396,46 @@ reserved on the disk, but no specific block has been allocated.")
     (28 :private-use)
     (29 :unassigned)))
 )
+
+(defconstant +debug-end-entry-op+ #x00)
+(defconstant +debug-add-var-op+ #x10)
+(defconstant +debug-add-hidden-var-op+ #x11)
+(defconstant +debug-drop-n-op+ #x40)
+(defconstant +debug-drop-op+ #x50)
+(defconstant +debug-update-n-op+ #x60)
+(defconstant +debug-update-op+ #x70)
+
+(defconstant +debug-repr-value+ 0)
+(defconstant +debug-repr-single-float+ 1)
+(defconstant +debug-repr-double-float+ 2)
+(defconstant +debug-repr-mmx-vector+ 3)
+(defconstant +debug-repr-sse-vector+ 4)
+(defconstant +debug-repr-fixnum+ 5)
+(defconstant +debug-repr-unsigned-byte-64+ 6)
+(defconstant +debug-repr-signed-byte-64+ 7)
+
+(defvar *debug-x86-64-register-encodings* #(:rax :rcx :rdx :rbx :rsp :rbp :rsi :rdi
+                                            :r8 :r9 :r10 :r11 :r12 :r13 :r14 :r15
+                                            :mm0 :mm1 :mm2 :mm3 :mm4 :mm5 :mm6 :mm7
+                                            :xmm0 :xmm1 :xmm2 :xmm3 :xmm4 :xmm5 :xmm6 :xmm7
+                                            :xmm8 :xmm9 :xmm10 :xmm11 :xmm12 :xmm13 :xmm14 :xmm15))
+
+(defvar *debug-arm64-register-encodings* #(:x0 :x1 :x2 :x3 :x4 :x5 :x6 :x7
+                                           :x8 :x9 :x10 :x11 :x12 :x13 :x14 :x15
+                                           :x16 :x17 :x18 :x19 :x20 :x21 :x22 :x23
+                                           :x24 :x25 :x26 :x27 :x28 :x29 :x30 :xzr
+                                           :q0 :q1 :q2 :q3 :q4 :q5 :q6 :q7
+                                           :q8 :q9 :q10 :q11 :q12 :q13 :q14 :q15
+                                           :q16 :q17 :q18 :q19 :q20 :q21 :q22 :q23
+                                           :q24 :q25 :q26 :q27 :q28 :q29 :q30 :q31))
+
+(defconstant +gcmd-flag0-frame+ 0)
+(defconstant +gcmd-flag0-interrupt+ 1)
+(defconstant +gcmd-flag0-block-or-tagbody-thunk+ 2)
+(defconstant +gcmd-flag0-incoming-arguments+ 3)
+(defconstant +gcmd-flag0-pushed-values-register+ 4)
+(defconstant +gcmd-flag0-extra-registers+ (byte 2 5))
+(defconstant +gcmd-flag0-restart+ 7)
+
+(defconstant +gcmd-flag1-multiple-values+ (byte 4 0))
+(defconstant +gcmd-flag1-incoming-arguments-location+ (byte 4 4))

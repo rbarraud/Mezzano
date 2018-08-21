@@ -18,7 +18,13 @@
                 #:funcallable-std-instance-slots
                 #:funcallable-std-instance-layout)
   (:export #:defclass #:defgeneric #:defmethod
-           #:find-class #:class-of
+
+           #:find-class
+           #:find-class-in-reference
+           #:class-reference
+           #:class-reference-class
+
+           #:class-of
            #:call-next-method #:next-method-p
            #:slot-value #:slot-boundp #:slot-exists-p #:slot-makunbound
            #:make-instance #:change-class
@@ -41,6 +47,7 @@
            #:class-direct-methods
            #:class-finalized-p
            #:class-prototype
+           #:class-default-initargs #:class-direct-default-initargs
            #:generic-function-name #:generic-function-lambda-list
            #:generic-function-methods #:generic-function-discriminating-function
            #:generic-function-method-class
@@ -62,6 +69,7 @@
            #:finalize-inheritance #:allocate-instance
            #:slot-value-using-class #:slot-boundp-using-class
            #:slot-exists-p-using-class #:slot-makunbound-using-class
+           #:compute-default-initargs
            ;;
            ;; Generic function related metaobject protocol
            ;;

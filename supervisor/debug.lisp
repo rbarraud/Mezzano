@@ -196,9 +196,7 @@
                (return))
             (let* ((function (sys.int::return-address-to-function return-address))
                    (info (sys.int::%object-header-data function))
-                   (mc-size (ldb (byte sys.int::+function-machine-code-size+
-                                       sys.int::+function-machine-code-position+)
-                                 info))
+                   (mc-size (ldb sys.int::+function-header-code-size+ info))
                    ;; First entry in the constant pool.
                    (address (logand (sys.int::lisp-object-address function) -16))
                    (name (sys.int::memref-t address (* mc-size 2))))
@@ -242,9 +240,7 @@
                  (return))
               (let* ((function (sys.int::return-address-to-function return-address))
                      (info (sys.int::%object-header-data function))
-                     (mc-size (ldb (byte sys.int::+function-machine-code-size+
-                                         sys.int::+function-machine-code-position+)
-                                   info))
+                     (mc-size (ldb sys.int::+function-header-code-size+ info))
                      ;; First entry in the constant pool.
                      (address (logand (sys.int::lisp-object-address function) -16))
                      (name (sys.int::memref-t address (* mc-size 2))))
@@ -252,8 +248,16 @@
           (debug-print-line)))))
   (panic-print-backtrace fp))
 
+(defun dump-irq (irq)
+  (debug-print-line "IRQ " irq " - " (irq-platform-number irq) " (" (irq-count irq) " delivered)")
+  (dolist (a (irq-attachments irq))
+    (debug-print-line "  " a " " (irq-attachment-device a)
+                      (if (irq-attachment-exclusive-p a) " [exclusive]" "")
+                      (if (irq-attachment-pending-eoi a) " EOI pending" ""))))
+
 (defun debug-dump-threads ()
   (dump-run-queues)
+  (map-platform-irqs #'dump-irq)
   (dump-thread (current-thread) (sys.int::read-frame-pointer))
   (when (boundp '*all-threads*)
     (do ((thread *all-threads*
@@ -277,9 +281,14 @@
     #+x86-64
     (disable-page-fault-ist)
     (debug-print-line "----- PANIC -----")
-    (debug-print-line-1 things)
-    (when extra
-      (funcall extra))
+    (block nil
+      (with-page-fault-hook
+          (()
+           (debug-write-string "--truncated--")
+           (return))
+        (debug-print-line-1 things)
+        (when extra
+          (funcall extra))))
     (debug-dump-threads)
     (loop (%arch-panic-stop))))
 
@@ -287,10 +296,6 @@
   "A simple supervisor-safe ASSERT-like macro."
   `(when (not ,condition)
      (panic ,@things)))
-
-(in-package :sys.int)
-
-(defstruct (cold-stream (:area :wired)))
 
 (in-package :mezzano.supervisor)
 
@@ -355,8 +360,9 @@
 (defun sys.int::raise-type-error (datum expected-type)
   (panic "Type error. Expected " expected-type " got " datum))
 
-(defun sys.int::raise-invalid-argument-error ()
-  (panic "Invalid arguments."))
+(defun sys.int::raise-invalid-argument-error (&rest args sys.int::&closure function)
+  (declare (ignore args))
+  (panic "Invalid arguments to " function))
 
 (defun error (datum &rest arguments)
   (declare (dynamic-extent arguments))

@@ -333,46 +333,62 @@ TLB shootdown must be protected by the VM lock."
   next
   (sys.lap-x86:ret))
 
+(sys.int::define-lap-function %wbinvd (())
+  (:gc :no-frame :layout #*0)
+  (sys.lap-x86:wbinvd)
+  (sys.lap-x86:ret))
+
+(defun populate-idt (vector)
+  ;; IDT completely fills the second page (256 * 16)
+  (dotimes (i 256)
+    (multiple-value-bind (lo hi)
+        (if (svref sys.int::*interrupt-service-routines* i)
+            (make-idt-entry :offset (sys.int::%object-ref-signed-byte-64
+                                     (svref sys.int::*interrupt-service-routines* i)
+                                     sys.int::+function-entry-point+)
+                            ;; Take CPU interrupts on the exception stack
+                            ;; and IRQs on the interrupt stack.
+                            :ist (if (< i 32)
+                                     1
+                                     2))
+            (values 0 0))
+      (setf (sys.int::%object-ref-unsigned-byte-64 vector (+ +cpu-info-idt-offset+ (* i 2))) lo
+            (sys.int::%object-ref-unsigned-byte-64 vector (+ +cpu-info-idt-offset+ (* i 2) 1)) hi))))
+
+(defun populate-gdt (vector tss-base)
+  ;; GDT.
+  (setf (sys.int::%object-ref-unsigned-byte-64 vector (+ +cpu-info-gdt-offset+ 0)) 0 ; NULL seg.
+        (sys.int::%object-ref-unsigned-byte-64 vector (+ +cpu-info-gdt-offset+ 1)) #x00209A0000000000 ; Kernel CS64
+        ;; TSS low.
+        ;; Does not fit in a fixnum when treated as a 64-bit value, depending on where the info page
+        ;; was allocated. Use 32-bit accesses to work around.
+        (sys.int::%object-ref-unsigned-byte-32 vector (+ (* (+ +cpu-info-gdt-offset+ 2) 2) 0)) (logior (ldb (byte 16 0) +cpu-info-tss-size+)
+                                                                                                       (ash (ldb (byte 16 0) tss-base) 16))
+        (sys.int::%object-ref-unsigned-byte-32 vector (+ (* (+ +cpu-info-gdt-offset+ 2) 2) 1)) (logior (ldb (byte 8 16) tss-base)
+                                                                                                       (ash #x89 8)
+                                                                                                       (ash (ldb (byte 4 16) +cpu-info-tss-size+) 16)
+                                                                                                       (ash (ldb (byte 8 24) tss-base) 24))
+        ;; TSS high.
+        (sys.int::%object-ref-unsigned-byte-64 vector (+ +cpu-info-gdt-offset+ 3)) (ldb (byte 32 32) tss-base)))
+
+(defun populate-tss (tss-base exception-stack-pointer irq-stack-pointer)
+  ;; TSS, Clear memory first.
+  (dotimes (i +cpu-info-tss-size+)
+    (setf (sys.int::memref-unsigned-byte-16 tss-base i) 0))
+  ;; IST1.
+  (setf (sys.int::memref-signed-byte-64 (+ tss-base +tss-ist-1+) 0) exception-stack-pointer)
+  ;; IST2.
+  (setf (sys.int::memref-signed-byte-64 (+ tss-base +tss-ist-2+) 0) irq-stack-pointer)
+  ;; I/O Map Base Address, follows TSS body.
+  (setf (sys.int::memref-unsigned-byte-16 (+ tss-base +tss-io-map-base+) 0) +cpu-info-tss-size+))
+
 (defun populate-cpu-info-vector (vector wired-stack-pointer exception-stack-pointer irq-stack-pointer idle-thread)
   (let* ((addr (- (sys.int::lisp-object-address vector)
                   sys.int::+tag-object+))
          (tss-base (+ addr 8 (* +cpu-info-tss-offset+ 8))))
-    ;; IDT completely fills the second page (256 * 16)
-    (dotimes (i 256)
-      (multiple-value-bind (lo hi)
-          (if (svref sys.int::*interrupt-service-routines* i)
-              (make-idt-entry :offset (sys.int::%object-ref-signed-byte-64
-                                       (svref sys.int::*interrupt-service-routines* i)
-                                       sys.int::+function-entry-point+)
-                              :ist (cond ((eql i 14) 1) ; page fault.
-                                         ((>= i 32) 2) ; IRQ
-                                         (t 0)))
-              (values 0 0))
-        (setf (sys.int::%object-ref-unsigned-byte-64 vector (+ +cpu-info-idt-offset+ (* i 2))) lo
-              (sys.int::%object-ref-unsigned-byte-64 vector (+ +cpu-info-idt-offset+ (* i 2) 1)) hi)))
-    ;; GDT.
-    (setf (sys.int::%object-ref-unsigned-byte-64 vector (+ +cpu-info-gdt-offset+ 0)) 0 ; NULL seg.
-          (sys.int::%object-ref-unsigned-byte-64 vector (+ +cpu-info-gdt-offset+ 1)) #x00209A0000000000 ; Kernel CS64
-          ;; TSS low.
-          ;; Does not fit in a fixnum when treated as a 64-bit value, depending on where the info page
-          ;; was allocated. Use 32-bit accesses to work around.
-          (sys.int::%object-ref-unsigned-byte-32 vector (+ (* (+ +cpu-info-gdt-offset+ 2) 2) 0)) (logior (ldb (byte 16 0) +cpu-info-tss-size+)
-                                                                                                           (ash (ldb (byte 16 0) tss-base) 16))
-          (sys.int::%object-ref-unsigned-byte-32 vector (+ (* (+ +cpu-info-gdt-offset+ 2) 2) 1)) (logior (ldb (byte 8 16) tss-base)
-                                                                                                         (ash #x89 8)
-                                                                                                         (ash (ldb (byte 4 16) +cpu-info-tss-size+) 16)
-                                                                                                         (ash (ldb (byte 8 24) tss-base) 24))
-          ;; TSS high.
-          (sys.int::%object-ref-unsigned-byte-64 vector (+ +cpu-info-gdt-offset+ 3)) (ldb (byte 32 32) tss-base))
-    ;; TSS, Clear memory first.
-    (dotimes (i +cpu-info-tss-size+)
-      (setf (sys.int::memref-unsigned-byte-16 tss-base i) 0))
-    ;; IST1.
-    (setf (sys.int::memref-signed-byte-64 (+ tss-base +tss-ist-1+) 0) exception-stack-pointer)
-    ;; IST2.
-    (setf (sys.int::memref-signed-byte-64 (+ tss-base +tss-ist-2+) 0) irq-stack-pointer)
-    ;; I/O Map Base Address, follows TSS body.
-    (setf (sys.int::memref-unsigned-byte-16 (+ tss-base +tss-io-map-base+) 0) +cpu-info-tss-size+)
+    (populate-idt vector)
+    (populate-gdt vector tss-base)
+    (populate-tss tss-base exception-stack-pointer irq-stack-pointer)
     ;; Other stuff.
     (setf (sys.int::%object-ref-t vector +cpu-info-self-offset+) vector)
     (setf (sys.int::%object-ref-signed-byte-64 vector +cpu-info-wired-stack-offset+)
@@ -413,6 +429,7 @@ TLB shootdown must be protected by the VM lock."
   ;; properly. Liberal use of address-size-override and 32-bit addressing
   ;; modes are required in 16-bit code.
   (sys.lap-x86:!code16)
+  (sys.lap-x86:wbinvd)
   ;; Unify segments.
   ;; All memory access must be relative to CS until in 64-bit mode.
   (sys.lap-x86:movseg :bx :cs)
@@ -485,6 +502,8 @@ TLB shootdown must be protected by the VM lock."
                                    (ash 1 1) ; MP
                                    (ash 1 5) ; NE
                                    (ash 1 16))) ; WP
+  ;; Clear CD/NW. VirtualBox, KVM, and Bochs start CPUs with them set.
+  (sys.lap-x86:and32 :eax #.(lognot #x60000000))
   (sys.lap-x86:movcr :cr0 :eax)
   ;; Clear EFLAGS.
   (sys.lap-x86:push 0)
@@ -541,6 +560,7 @@ TLB shootdown must be protected by the VM lock."
   ;; No arguments
   (sys.lap-x86:xor32 :ecx :ecx)
   (sys.lap-x86:jmp (:object :rax #.sys.int::+fref-entry-point+))
+  (:align 16)
   gdtr
   (:d16/le (- temporary-gdt-end temporary-gdt 1)) ; Length
   gdtr-pointer
@@ -548,12 +568,14 @@ TLB shootdown must be protected by the VM lock."
   idtr
   (:d16/le 0)
   (:d32/le 0)
+  (:align 16)
   temporary-gdt
   (:d64/le 0)
   (:d64/le #x00209A0000000000)
   (:d64/le #x00CF9A000000FFFF)
   (:d64/le #x00CF92000000FFFF)
   temporary-gdt-end
+  (:align 16)
   temporary-stack
   (:d32/le 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0)
   temporary-stack-top)
@@ -630,7 +652,9 @@ TLB shootdown must be protected by the VM lock."
   (setf (physical-memref-unsigned-byte-64 (+ physical-address +ap-bootstrap-real-pml4-offset+))
         (sys.int::%cr3))
   (setf (physical-memref-unsigned-byte-64 (+ physical-address +ap-bootstrap-initial-pml4-offset+))
-        initial-pml4))
+        initial-pml4)
+  ;; Make sure other CPUs see the trampoline before they receive INIT.
+  (%wbinvd))
 
 (defun lapic-setup ()
   (setf (lapic-reg +lapic-reg-spurious-interrupt-vector+) #x1FF))
@@ -731,7 +755,8 @@ TLB shootdown must be protected by the VM lock."
 
 (defun detect-secondary-cpus ()
   (let ((bsp-apic-id (cpu-apic-id *bsp-cpu*))
-        (madt (acpi-get-table 'acpi-madt-table-p)))
+        (madt (acpi-get-table 'acpi-madt-table-p))
+        (did-warn nil))
     (when madt
       ;; Walk the ACPI MADT table looking for enabled CPUs.
       (dotimes (i (sys.int::simple-vector-length
@@ -741,6 +766,9 @@ TLB shootdown must be protected by the VM lock."
                      (logbitp +acpi-madt-processor-lapic-flag-enabled+
                               (acpi-madt-processor-lapic-flags entry))
                      (not (eql (acpi-madt-processor-lapic-apic-id entry) bsp-apic-id)))
+            (when (not did-warn)
+              (debug-print-line "### Multiple CPUs detected. SMP support is currently experimental and unreliable.")
+              (setf did-warn t))
             (register-secondary-cpu (acpi-madt-processor-lapic-apic-id entry))))))))
 
 (defun boot-secondary-cpus ()
